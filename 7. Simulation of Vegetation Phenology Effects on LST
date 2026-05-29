@@ -1,0 +1,1651 @@
+# -*- coding: utf-8 -*-
+import os, re, time, math
+import numpy as np
+import pandas as pd
+import rasterio
+from rasterio.enums import Resampling
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+
+ROOT = "/content/drive/MyDrive/anature_revised/data"
+OUT_TSER = "/content/drive/MyDrive/anature_revised/typical_timeseries_fast.csv"
+
+# ======================
+# ======================
+MAX_CITIES_TOTAL    = 100   
+MAX_CITIES_PER_CLIM = 12     
+MAX_YEARS_PER_CITY  = 1      
+COARSE_FACTOR       = 10     
+STEP_STRIDE         = 2       
+USE_NTL             = True   
+RANDOM_SEED         = 42
+rng = np.random.default_rng(RANDOM_SEED)
+
+os.environ["GDAL_NUM_THREADS"] = "ALL_CPUS"
+os.environ["GDAL_CACHEMAX"] = "1024"
+
+T8 = 46
+ERA5_SUBVARS = ["T2M","TD","VPD","WIND10M","SSRD","TP","SWVL1","STL1"]  # 8*46=368
+
+year_re = re.compile(r".*_(\d{4})\.tif$", re.IGNORECASE)
+
+# ----------------------
+# climate mapping (A/B/C/D/UNK)
+# ----------------------
+def koppen_to_major(k):
+    if not isinstance(k, str) or len(k)==0:
+        return "UNK"
+    return k[0].upper()
+
+city2clim = {}
+if "koppen_df" in globals():
+    tmp = koppen_df.copy()
+    tmp["clim_major"] = tmp["koppen"].apply(koppen_to_major)
+    city2clim = dict(zip(tmp["city_key"].astype(str), tmp["clim_major"].astype(str)))
+
+def clim_of_city(city):
+    return city2clim.get(city, "UNK")
+
+# ----------------------
+# utilities
+# ----------------------
+def list_cities(root):
+    return sorted([d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))])
+
+def find_years_in_city(cdir):
+    years = []
+    for fn in os.listdir(cdir):
+        fnl = fn.lower()
+        if fnl.endswith(".tif") and ("_evi_8day_0p1deg_" in fnl or "_lst_8day_0p1deg_" in fnl or "_lstd_8day_0p1deg_" in fnl):
+            m = year_re.match(fn)
+            if m:
+                years.append(int(m.group(1)))
+    return sorted(list(set(years)))
+
+def pick_years(years, k):
+    if len(years) <= k:
+        return years
+    idx = rng.choice(len(years), size=k, replace=False)
+    return [years[i] for i in sorted(idx)]
+
+def p_city_var_year(city, var, year):
+    """
+    var: DEM/EVI/LAI/LST/ERA5LMAIN/NTL/LC
+    """
+    if var == "LC":
+        return os.path.join(ROOT, city, f"{city}_MODIS_LC_STACK_2013_2025_0p005deg.tif")
+    if var == "NTL":
+        return os.path.join(ROOT, city, f"{city}_NTL_monthly_0p1deg_{year}.tif")
+    if var == "ERA5LMAIN":
+        return os.path.join(ROOT, city, f"{city}_ERA5Lmain_8day_0p1deg_{year}.tif")
+    return os.path.join(ROOT, city, f"{city}_{var}_8day_0p1deg_{year}.tif")
+
+def out_hw(H, W, factor):
+    return int(math.ceil(H / factor)), int(math.ceil(W / factor))
+
+def robust_summary(vecs_2d):
+    """
+    vecs_2d: (n_series, T)
+    return mean, p10, p90
+    """
+    mean = np.nanmean(vecs_2d, axis=0)
+    p10  = np.nanpercentile(vecs_2d, 10, axis=0)
+    p90  = np.nanpercentile(vecs_2d, 90, axis=0)
+    return mean, p10, p90
+
+def monthly12_to_46(x12):
+    x12 = np.asarray(x12, float)
+    t12 = np.linspace(0, T8-1, num=12)
+    t46 = np.arange(T8)
+    return np.interp(t46, t12, x12)
+
+# ----------------------
+# fast read: bulk bands + coarse resample
+# ----------------------
+def read_coarse_allbands(path, band_ids=None, factor=10):
+    """
+    return data: (B, oh, ow) float32 with nan
+    """
+    with rasterio.open(path) as ds:
+        H, W = ds.height, ds.width
+        oh, ow = out_hw(H, W, factor)
+        if band_ids is None:
+            band_ids = list(range(1, ds.count+1))
+        data = ds.read(
+            indexes=band_ids,
+            masked=True,
+            out_shape=(len(band_ids), oh, ow),
+            resampling=Resampling.average
+        ).astype(np.float32)
+        if np.ma.isMaskedArray(data):
+            data = data.filled(np.nan)
+        return data  # (B,oh,ow)
+
+def median_over_grid(data_bhw):
+    """
+    data_bhw: (B,H,W)
+    return med per band: (B,)
+    """
+    B = data_bhw.shape[0]
+    flat = data_bhw.reshape(B, -1)
+    med = np.nanmedian(flat, axis=1)
+    return med
+
+# ----------------------
+# extract one city-year seasonal curves (fast)
+# ----------------------
+def extract_city_year_fast(city, year):
+
+    out = {}
+
+    # ---------------------------
+    # 8-day variables
+    # ---------------------------
+    for var in ["EVI","LAI","LST","DEM"]:
+
+        p = p_city_var_year(city, var, year)
+        if not os.path.exists(p):
+            continue
+
+        with rasterio.open(p) as ds:
+
+            band_count = ds.count
+            H,W = ds.height,ds.width
+
+            oh,ow = out_hw(H,W,COARSE_FACTOR)
+
+            data = ds.read(
+                masked=True,
+                out_shape=(band_count,oh,ow),
+                resampling=Resampling.average
+            )
+
+            data = data.astype(np.float32)
+
+            if np.ma.isMaskedArray(data):
+                data = data.filled(np.nan)
+
+            med = np.nanmedian(data.reshape(band_count,-1),axis=1)
+
+            y = np.full(T8,np.nan)
+
+            n = min(T8,band_count)
+
+            y[:n] = med[:n]
+
+            out[var] = y
+
+
+    # ---------------------------
+    # ERA5Lmain
+    # ---------------------------
+
+    p = p_city_var_year(city,"ERA5LMAIN",year)
+
+    if os.path.exists(p):
+
+        with rasterio.open(p) as ds:
+
+            band_count = ds.count
+            H,W = ds.height,ds.width
+
+            oh,ow = out_hw(H,W,COARSE_FACTOR)
+
+            data = ds.read(
+                masked=True,
+                out_shape=(band_count,oh,ow),
+                resampling=Resampling.average
+            )
+
+            data = data.astype(np.float32)
+
+            if np.ma.isMaskedArray(data):
+                data = data.filled(np.nan)
+
+            med = np.nanmedian(data.reshape(band_count,-1),axis=1)
+
+            nstep = band_count // 8
+
+            for j,var in enumerate(ERA5_SUBVARS):
+
+                y = np.full(T8,np.nan)
+
+                for s in range(min(nstep,T8)):
+
+                    idx = s*8 + j
+
+                    if idx < band_count:
+
+                        y[s] = med[idx]
+
+                out[f"ERA5_{var}"] = y
+
+
+    # ---------------------------
+    # NTL
+    # ---------------------------
+
+    if USE_NTL:
+
+        p = p_city_var_year(city,"NTL",year)
+
+        if os.path.exists(p):
+
+            with rasterio.open(p) as ds:
+
+                band_count = min(ds.count,12)
+
+                H,W = ds.height,ds.width
+
+                oh,ow = out_hw(H,W,COARSE_FACTOR)
+
+                data = ds.read(
+                    masked=True,
+                    out_shape=(band_count,oh,ow),
+                    resampling=Resampling.average
+                )
+
+                data = data.astype(np.float32)
+
+                if np.ma.isMaskedArray(data):
+                    data = data.filled(np.nan)
+
+                med = np.nanmedian(data.reshape(band_count,-1),axis=1)
+
+                if np.isfinite(med).sum()>=6:
+
+                    out["NTL"] = monthly12_to_46(med)
+
+    return out
+
+# ======================
+# Run (stratified by climate)
+# ======================
+all_cities = list_cities(ROOT)
+rng.shuffle(all_cities)
+
+by_clim = {}
+for c in all_cities:
+    by_clim.setdefault(clim_of_city(c), []).append(c)
+
+picked = []
+for clim, lst in by_clim.items():
+    picked += lst[:min(len(lst), MAX_CITIES_PER_CLIM)]
+picked = picked[:MAX_CITIES_TOTAL]
+
+print("Picked cities total:", len(picked))
+print("Picked by clim:", {k: sum(1 for c in picked if clim_of_city(c)==k) for k in sorted(set(by_clim.keys()))})
+
+rows = []
+t0 = time.time()
+
+for city in tqdm(picked, desc="FAST Part1 Cities"):
+    cdir = os.path.join(ROOT, city)
+    years = find_years_in_city(cdir)
+    if not years:
+        continue
+    years_use = pick_years(years, MAX_YEARS_PER_CITY)
+
+    for y in years_use:
+        t1 = time.time()
+        series = extract_city_year_fast(city, y)
+        dt = time.time() - t1
+        # 你可以看每城耗时
+        # print(f"[{city} {y}] extracted vars={len(series)} in {dt:.2f}s")
+
+        clim = clim_of_city(city)
+        for var, vec in series.items():
+            rows.append({"city": city, "clim_major": clim, "year": y, "var": var, "y": vec})
+
+print("Total time (s):", time.time()-t0)
+
+df = pd.DataFrame(rows)
+if df.empty:
+    raise RuntimeError("No series extracted. Check paths / city names / years.")
+
+# typical curves: clim × var
+typ = []
+for (clim, var), g in df.groupby(["clim_major","var"]):
+    Y = np.vstack(g["y"].values)  # (n,46)
+    mean, p10, p90 = robust_summary(Y)
+    for s in range(T8):
+        typ.append({
+            "clim_major": clim, "var": var, "step": s,
+            "mean": float(mean[s]), "p10": float(p10[s]), "p90": float(p90[s]),
+            "n_series": int(Y.shape[0])
+        })
+
+df_typ = pd.DataFrame(typ).sort_values(["clim_major","var","step"]).reset_index(drop=True)
+df_typ.to_csv(OUT_TSER, index=False)
+print("✅ Saved:", OUT_TSER)
+print(df_typ.head(20).to_string(index=False))
+
+# ======================
+# Plot quick sanity
+# ======================
+def plot_typ(clim="A", vars_to_plot=None):
+    if vars_to_plot is None:
+        vars_to_plot = ["EVI","LAI","LST","ERA5_SSRD","ERA5_VPD","ERA5_TP","ERA5_SWVL1","ERA5_WIND10M","NTL"]
+    plt.figure(figsize=(14,10))
+    k = 1
+    for v in vars_to_plot:
+        sub = df_typ[(df_typ["clim_major"]==clim) & (df_typ["var"]==v)].sort_values("step")
+        if sub.empty:
+            continue
+        x = sub["step"].values
+        plt.subplot(3,3,k); k += 1
+        plt.plot(x, sub["mean"].values, marker="o", linewidth=1)
+        plt.fill_between(x, sub["p10"].values, sub["p90"].values, alpha=0.25)
+        plt.title(f"{clim} - {v}")
+        plt.grid(True, alpha=0.3)
+        if k > 9: break
+    plt.tight_layout()
+    plt.show()
+
+plot_typ("A")
+plot_typ("C")
+
+# -*- coding: utf-8 -*-
+"""
+GLOBAL (NH-like) | Green-up advance within spring window | CatBoost + Monte Carlo
++ Uncertainty analysis:
+  (1) Sampling uncertainty within each setting (CI via SEM or percentile)
+  (2) Method uncertainty across settings (band across settings)
+
+Fixes your error:
+- doys_from_steps has explicit signature (T, dt_days)
+- compute_metrics always calls doys_from_steps(T, dt_days) safely
+"""
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from catboost import CatBoostRegressor
+
+# =========================
+# 0) PATHS (edit these)
+# =========================
+MODEL_PATH   = "/content/GZ_model_20260305_032709/catboost_model.cbm"
+CHANNELS_NPY = "/content/GZ_model_20260305_032709/channels.npy"  # strongly recommend use this
+TYPICAL_CSV  = "/content/drive/MyDrive/anature_revised/typical_timeseries_fast.csv"
+
+OUT_DIR = "/content/drive/MyDrive/anature_revised"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# =========================
+# 1) CORE SETTINGS
+# =========================
+T = 46
+DT_DAYS = 8.0
+DELTA_DAYS_LIST = list(range(0, 31, 1))
+
+# Monte Carlo
+N_MC_PER_GROUP = 300     # 先跑 200-300 测试；最终可 600+
+RANDOM_SEED = 42
+
+# Hemisphere mode (NH-like)
+HEMISPHERE_MODE = "NH"   # "NH" or "GLOBAL"
+
+# Warm season
+WARM_DOY = (160, 240)
+
+# Only perturb vegetation
+SHIFT_VARS_MODEL = ["EVI.EVI", "LAI.LAI"]
+
+# CI inside each setting
+CI_MODE = "sem"          # "sem" or "percentile"
+CI_ALPHA = 0.05          # 95%
+WINSORIZE = True
+WINSOR_Q_LO = 2.5
+WINSOR_Q_HI = 97.5
+
+# Robust peak definition (key)
+ROBUST_PEAK_MODE = "topk"   # "topk" or "pctl"
+ROBUST_TOPK = 3
+ROBUST_PCTL = 99
+
+# GLOBAL weight
+GLOBAL_WEIGHT_MODE = "equal"  # or "by_ncity" if you have city counts
+
+# Typical -> model channel mapping
+MAP_TYPICAL_TO_MODEL = {
+    "DEM": "DEM.DEM",
+    "NTL": "NTL.NTL",
+    "LC":  "MODIS.LC",
+    "EVI": "EVI.EVI",
+    "LAI": "LAI.LAI",
+    "ERA5_SSRD":   "ERA5LMAIN.SSRD",
+    "ERA5_TP":     "ERA5LMAIN.TP",
+    "ERA5_SWVL1":  "ERA5LMAIN.SWVL1",
+    "ERA5_VPD":    "ERA5LMAIN.VPD",
+    "ERA5_WIND10M":"ERA5LMAIN.WIND10M",
+    "ERA5_T2M":    "ERA5LMAIN.T2M",
+    "ERA5_TD":     "ERA5LMAIN.TD",
+    "ERA5_STL1":   "ERA5LMAIN.STL1",
+}
+
+# Noise multipliers (baseline suggestion)
+NOISE_MULT = {
+    "EVI.EVI": 0.45,
+    "LAI.LAI": 0.40,
+    "ERA5LMAIN.SSRD": 0.12,
+    "ERA5LMAIN.VPD":  0.12,
+    "ERA5LMAIN.TP":   0.10,
+    "ERA5LMAIN.SWVL1":0.10,
+    "ERA5LMAIN.WIND10M":0.10,
+    "ERA5LMAIN.T2M":  0.08,
+    "ERA5LMAIN.TD":   0.08,
+    "ERA5LMAIN.STL1": 0.08,
+    "NTL.NTL": 0.02,
+    "DEM.DEM": 0.00,
+    "MODIS.LC":0.00,
+}
+DEFAULT_NOISE_MULT = 0.08
+
+# =========================
+# 2) Utility functions
+# =========================
+def _infer_cols(df):
+    cols = set(df.columns.str.lower())
+    is_long = ("clim_major" in cols) and (("var" in cols) or ("variable" in cols))
+    return "long" if is_long else "wide"
+
+def _resample_to_T(x, T=46):
+    x = np.asarray(x, dtype=float)
+    n = len(x)
+    if n == T:
+        return x.copy()
+    if n < 2:
+        return np.full(T, np.nan)
+    t0 = np.linspace(0, 1, n)
+    t1 = np.linspace(0, 1, T)
+    return np.interp(t1, t0, x)
+
+def doys_from_steps(T=46, dt_days=8.0):
+    # midpoint DOY of each 8-day bin
+    return np.arange(T, dtype=float) * dt_days + dt_days/2.0
+
+def circular_diff(a, b, period=365.0):
+    d = (a - b) % period
+    if d > period/2:
+        d -= period
+    return d
+
+def stable_seed(key, mc, base_seed=42):
+    s = str(key)
+    h = 2166136261
+    for ch in s:
+        h ^= ord(ch)
+        h = (h * 16777619) & 0xFFFFFFFF
+    return (base_seed + (h % 100000) * 1000 + mc) % (2**32 - 1)
+
+def ar1_noise(T, sigma, rho=0.9, rng=None):
+    rng = np.random.default_rng() if rng is None else rng
+    if (not np.isfinite(sigma)) or sigma <= 0:
+        return np.zeros(T, dtype=float)
+    eps = rng.normal(0, 1, size=T)
+    x = np.zeros(T, dtype=float)
+    x[0] = rng.normal(0, sigma)
+    innov = sigma * np.sqrt(max(1e-8, 1 - rho**2))
+    for t in range(1, T):
+        x[t] = rho * x[t-1] + innov * eps[t]
+    return x
+
+def winsorize(arr, qlo=2.5, qhi=97.5):
+    arr = np.asarray(arr, dtype=float)
+    lo = np.nanpercentile(arr, qlo)
+    hi = np.nanpercentile(arr, qhi)
+    return np.clip(arr, lo, hi)
+
+# =========================
+# 3) Robust peak metrics
+# =========================
+def robust_peak_value(x, mode="topk", topk=3, pctl=99):
+    x = np.asarray(x, float)
+    x = x[np.isfinite(x)]
+    if len(x) == 0:
+        return np.nan
+    if mode == "pctl":
+        return float(np.nanpercentile(x, pctl))
+    k = int(max(1, min(topk, len(x))))
+    idx = np.argsort(x)[-k:]
+    return float(np.nanmean(x[idx]))
+
+def robust_peak_time_doy(x, dt_days=8.0, mode="topk", topk=3, pctl=99):
+    x = np.asarray(x, float)
+    doys = doys_from_steps(len(x), dt_days)
+    m = np.isfinite(x)
+    if m.sum() == 0:
+        return np.nan
+    xv = x[m]
+    dv = doys[m]
+    if mode == "pctl":
+        thr = np.nanpercentile(xv, pctl)
+        sel = xv >= thr
+        if sel.sum() >= 2:
+            return float(np.nanmean(dv[sel]))
+    k = int(max(1, min(topk, len(xv))))
+    idx = np.argsort(xv)[-k:]
+    return float(np.nanmean(dv[idx]))
+
+def compute_metrics(lst_series, warm_doy=WARM_DOY, dt_days=8.0):
+    x = np.asarray(lst_series, dtype=float)
+    doys = doys_from_steps(len(x), dt_days)
+
+    peak_time = robust_peak_time_doy(
+        x, dt_days=dt_days, mode=ROBUST_PEAK_MODE, topk=ROBUST_TOPK, pctl=ROBUST_PCTL
+    )
+    peak_val = robust_peak_value(
+        x, mode=ROBUST_PEAK_MODE, topk=ROBUST_TOPK, pctl=ROBUST_PCTL
+    )
+
+    m = (doys >= warm_doy[0]) & (doys <= warm_doy[1])
+    xw = x[m]
+    warm_mean = float(np.nanmean(xw))
+    warm_p90  = float(np.nanpercentile(xw, 90))
+    warm_p95  = float(np.nanpercentile(xw, 95))
+
+    thr = float(np.nanmedian(xw))
+    excess = np.maximum(0, xw - thr)
+    heat_expo = float(np.nansum(excess) * dt_days)
+
+    return dict(
+        peak_time_doy=peak_time,
+        peak_value=peak_val,
+        warm_mean=warm_mean,
+        warm_p90=warm_p90,
+        warm_p95=warm_p95,
+        heat_expo=heat_expo
+    )
+
+# =========================
+# 4) Green-up advance (local, no wrap)
+# =========================
+def shift_within_window_no_wrap(x_seg, advance_days, dt_days=8.0):
+    x_seg = np.asarray(x_seg, dtype=float)
+    L = len(x_seg)
+    if L <= 1 or advance_days <= 0:
+        return x_seg.copy()
+    s = advance_days / dt_days
+    k = np.arange(L, dtype=float)
+    src = np.clip(k + s, 0, L - 1)
+    i0 = np.floor(src).astype(int)
+    i1 = np.clip(i0 + 1, 0, L - 1)
+    w = src - i0
+    return (1 - w) * x_seg[i0] + w * x_seg[i1]
+
+def greenup_advance(x, advance_days, window_doy=(60, 180), dt_days=8.0, blend_steps=2):
+    x = np.asarray(x, dtype=float)
+    Tloc = len(x)
+    if advance_days <= 0:
+        return x.copy()
+
+    doys = doys_from_steps(Tloc, dt_days)
+    m = (doys >= window_doy[0]) & (doys <= window_doy[1])
+    idx = np.where(m)[0]
+    if len(idx) < 3:
+        return x.copy()
+
+    i0, i1 = idx[0], idx[-1]
+    seg = x[i0:i1+1]
+    seg_shift = shift_within_window_no_wrap(seg, advance_days, dt_days=dt_days)
+
+    y = x.copy()
+    y[i0:i1+1] = seg_shift
+
+    b = int(max(0, blend_steps))
+    if b > 0:
+        l0 = max(0, i0 - b)
+        for t in range(l0, i0):
+            ww = (t - l0 + 1) / (i0 - l0 + 1)
+            y[t] = (1 - ww) * x[t] + ww * y[t]
+        r1 = min(Tloc - 1, i1 + b)
+        for t in range(i1 + 1, r1 + 1):
+            ww = (r1 - t + 1) / (r1 - (i1 + 1) + 1)
+            y[t] = (1 - ww) * x[t] + ww * y[t]
+    return y
+
+# =========================
+# 5) Load model + channels
+# =========================
+model = CatBoostRegressor()
+model.load_model(MODEL_PATH)
+print("✅ Model loaded:", MODEL_PATH)
+
+assert os.path.exists(CHANNELS_NPY), "❌ channels.npy not found, please set CHANNELS_NPY"
+channels = np.load(CHANNELS_NPY, allow_pickle=True).tolist()
+feat2idx = {c:i for i,c in enumerate(channels)}
+print("Model expects:", channels)
+
+# =========================
+# 6) Load typical library
+# =========================
+df_typ = pd.read_csv(TYPICAL_CSV)
+if _infer_cols(df_typ) != "long":
+    raise RuntimeError("❌ typical_timeseries_fast.csv must be long-form: clim_major/var/step/...")
+
+cols = {c.lower(): c for c in df_typ.columns}
+clim_col = cols.get("clim_major", "clim_major")
+var_col  = cols.get("var", cols.get("variable", "var"))
+step_col = cols.get("step", "step")
+
+# mu column (prefer mean)
+mu_col = None
+for cand in ["mean", "mu", "p50", "median"]:
+    if cand in cols:
+        mu_col = cols[cand]
+        break
+if mu_col is None:
+    raise RuntimeError("❌ typical csv missing mean/mu/p50/median column")
+
+p10_col = cols.get("p10", None)
+p90_col = cols.get("p90", None)
+
+# Build library: clim -> model_channel -> {mu, sigma, plo, phi}
+lib = {}
+ncity_by_clim = {}
+
+for clim, g in df_typ.groupby(df_typ[clim_col]):
+    lib[clim] = {}
+    ncity_by_clim[clim] = int(g.get("city", pd.Series(dtype=object)).nunique()) if "city" in g.columns else 1
+
+    for var, gg in g.groupby(g[var_col]):
+        v = str(var)
+        model_ch = MAP_TYPICAL_TO_MODEL.get(v, v)
+        if model_ch not in feat2idx:
+            continue
+
+        gg = gg.sort_values(step_col)
+        mu = _resample_to_T(gg[mu_col].values, T)
+
+        # sigma approx from p10/p90 if available
+        if (p10_col is not None) and (p90_col is not None):
+            p10 = _resample_to_T(gg[p10_col].values, T)
+            p90 = _resample_to_T(gg[p90_col].values, T)
+            sigma = (p90 - p10) / 2.563
+            plo, phi = p10, p90
+        else:
+            sigma = np.full(T, 0.05)
+            plo, phi = mu - sigma, mu + sigma
+
+        lib[clim][model_ch] = dict(mu=mu, sigma=sigma, plo=plo, phi=phi)
+
+print("✅ Clim groups (raw):", sorted(lib.keys()))
+
+def infer_hemisphere_from_evi_peak(clim_key):
+    ch = "EVI.EVI"
+    if clim_key not in lib or ch not in lib[clim_key]:
+        return "UNK"
+    mu = lib[clim_key][ch]["mu"]
+    doys = doys_from_steps(len(mu), DT_DAYS)
+    peak_doy = float(doys[int(np.nanargmax(mu))])
+    return "NH" if peak_doy <= 200 else "SH"
+
+if HEMISPHERE_MODE == "NH":
+    hemi_by_clim = {c: infer_hemisphere_from_evi_peak(c) for c in lib.keys()}
+    keep = [c for c,h in hemi_by_clim.items() if h == "NH"]
+    lib = {c: lib[c] for c in keep}
+    ncity_by_clim = {c: ncity_by_clim.get(c, 1) for c in keep}
+    print("✅ Keep NH-like clim groups:", keep)
+else:
+    print("✅ Using GLOBAL clim groups.")
+
+if len(lib) == 0:
+    raise RuntimeError("❌ No clim groups left after NH filter.")
+
+# =========================
+# 7) Core simulation functions
+# =========================
+def predict_lst_series(X_ts):
+    return model.predict(X_ts).astype(np.float32)
+
+def gen_one_ts_for_clim(clim, rng, AR1_RHO=0.90, NOISE_SCALE=0.55, CLIP_TO_P_BOUNDS=True):
+    X = np.zeros((T, len(channels)), dtype=np.float32)
+    for j, ch in enumerate(channels):
+        if (clim in lib) and (ch in lib[clim]):
+            mu  = lib[clim][ch]["mu"]
+            sg  = lib[clim][ch]["sigma"]
+            plo = lib[clim][ch]["plo"]
+            phi = lib[clim][ch]["phi"]
+
+            mult = NOISE_MULT.get(ch, DEFAULT_NOISE_MULT)
+            sigma0 = float(np.nanmedian(sg)) * float(NOISE_SCALE) * float(mult)
+
+            x = mu + ar1_noise(T, sigma=sigma0, rho=AR1_RHO, rng=rng)
+
+            if CLIP_TO_P_BOUNDS:
+                x = np.minimum(np.maximum(x, plo), phi)
+
+            X[:, j] = x.astype(np.float32)
+        else:
+            X[:, j] = 0.0
+    return X
+
+def run_mc_global_setting(setting):
+    """
+    setting keys required:
+      name, AR1_RHO, NOISE_SCALE, GREENUP_DOY, BLEND_STEPS, CLIP
+    """
+    AR1 = setting["AR1_RHO"]
+    NS  = setting["NOISE_SCALE"]
+    GW  = setting["GREENUP_DOY"]
+    BS  = setting["BLEND_STEPS"]
+    CLIP = bool(setting["CLIP"])
+
+    rows = []
+    for clim in sorted(lib.keys()):
+        for mc in range(N_MC_PER_GROUP):
+            rng = np.random.default_rng(stable_seed((setting["name"], clim), mc, base_seed=RANDOM_SEED))
+
+            X0 = gen_one_ts_for_clim(clim, rng=rng, AR1_RHO=AR1, NOISE_SCALE=NS, CLIP_TO_P_BOUNDS=CLIP)
+            y0 = predict_lst_series(X0)
+            m0 = compute_metrics(y0, dt_days=DT_DAYS)
+
+            for d in DELTA_DAYS_LIST:
+                X1 = X0.copy()
+                for ch in SHIFT_VARS_MODEL:
+                    if ch in feat2idx:
+                        j = feat2idx[ch]
+                        X1[:, j] = greenup_advance(
+                            X1[:, j],
+                            advance_days=d,
+                            window_doy=GW,
+                            dt_days=DT_DAYS,
+                            blend_steps=BS
+                        ).astype(np.float32)
+
+                y1 = predict_lst_series(X1)
+                m1 = compute_metrics(y1, dt_days=DT_DAYS)
+
+                rows.append({
+                    "setting": setting["name"],
+                    "clim": clim,
+                    "mc": mc,
+                    "delta_days": d,
+                    "d_peak_time": circular_diff(m1["peak_time_doy"], m0["peak_time_doy"], period=365.0),
+                    "d_warm_p95": (m1["warm_p95"] - m0["warm_p95"]),
+                    "d_heat_expo":(m1["heat_expo"] - m0["heat_expo"]),
+                })
+    return pd.DataFrame(rows)
+
+def weighted_quantile(values, quantiles, sample_weight=None):
+    values = np.asarray(values, dtype=float)
+    quantiles = np.asarray(quantiles, dtype=float)
+    if sample_weight is None:
+        return np.quantile(values, quantiles)
+
+    w = np.asarray(sample_weight, dtype=float)
+    mask = np.isfinite(values) & np.isfinite(w)
+    values = values[mask]; w = w[mask]
+    if len(values) == 0:
+        return np.full_like(quantiles, np.nan, dtype=float)
+
+    sorter = np.argsort(values)
+    values = values[sorter]; w = w[sorter]
+    cdf = np.cumsum(w) - 0.5*w
+    cdf /= np.sum(w)
+    return np.interp(quantiles, cdf, values)
+
+def summarize_global_ci(df_all, mode="equal"):
+    metrics = ["d_peak_time","d_warm_p95","d_heat_expo"]
+    out = []
+    z = 1.96
+
+    for d, g in df_all.groupby("delta_days"):
+        if mode == "equal":
+            w = np.ones(len(g), dtype=float)
+        else:
+            w = g["clim"].map(lambda c: max(1.0, float(ncity_by_clim.get(c, 1)))).values
+
+        row = {"delta_days": int(d), "n": int(len(g))}
+        for m in metrics:
+            vals = g[m].values.astype(float)
+
+            if CI_MODE == "percentile" and WINSORIZE:
+                vals = winsorize(vals, WINSOR_Q_LO, WINSOR_Q_HI)
+
+            mean = float(np.average(vals, weights=w))
+            row[m+"_mean"] = mean
+
+            if CI_MODE == "sem":
+                var = float(np.average((vals - mean)**2, weights=w))
+                std = np.sqrt(max(1e-12, var))
+                sem = std / np.sqrt(len(vals))
+                row[m+"_lo"] = mean - z * sem
+                row[m+"_hi"] = mean + z * sem
+            else:
+                qlo = CI_ALPHA/2
+                qhi = 1 - CI_ALPHA/2
+                lo, hi = weighted_quantile(vals, [qlo, qhi], sample_weight=w)
+                row[m+"_lo"] = float(lo)
+                row[m+"_hi"] = float(hi)
+
+        out.append(row)
+
+    return pd.DataFrame(out).sort_values("delta_days").reset_index(drop=True)
+
+# =========================
+# 8) Parameter grid (method uncertainty)
+# =========================
+PARAM_GRID = [
+    {"name":"base",     "AR1_RHO":0.90, "NOISE_SCALE":0.55, "GREENUP_DOY":(60,180), "BLEND_STEPS":2, "CLIP":True},
+    {"name":"lowNoise", "AR1_RHO":0.90, "NOISE_SCALE":0.40, "GREENUP_DOY":(60,180), "BLEND_STEPS":2, "CLIP":True},
+    {"name":"highNoise","AR1_RHO":0.90, "NOISE_SCALE":0.70, "GREENUP_DOY":(60,180), "BLEND_STEPS":2, "CLIP":True},
+    {"name":"lowRho",   "AR1_RHO":0.70, "NOISE_SCALE":0.55, "GREENUP_DOY":(60,180), "BLEND_STEPS":2, "CLIP":True},
+    {"name":"highRho",  "AR1_RHO":0.95, "NOISE_SCALE":0.55, "GREENUP_DOY":(60,180), "BLEND_STEPS":2, "CLIP":True},
+    {"name":"wideWin",  "AR1_RHO":0.90, "NOISE_SCALE":0.55, "GREENUP_DOY":(45,200), "BLEND_STEPS":2, "CLIP":True},
+    {"name":"narrowWin","AR1_RHO":0.90, "NOISE_SCALE":0.55, "GREENUP_DOY":(75,165), "BLEND_STEPS":2, "CLIP":True},
+    {"name":"noClip",   "AR1_RHO":0.90, "NOISE_SCALE":0.55, "GREENUP_DOY":(60,180), "BLEND_STEPS":2, "CLIP":False},
+    {"name":"blend0",   "AR1_RHO":0.90, "NOISE_SCALE":0.55, "GREENUP_DOY":(60,180), "BLEND_STEPS":0, "CLIP":True},
+]
+
+# =========================
+# 9) Run ensemble
+# =========================
+all_raw = []
+all_ci  = []
+
+for st in PARAM_GRID:
+    print(f"== Running setting: {st['name']} ==")
+    df_raw = run_mc_global_setting(st)
+    df_ci  = summarize_global_ci(df_raw, mode=GLOBAL_WEIGHT_MODE)
+    df_ci["setting"] = st["name"]
+
+    all_raw.append(df_raw)
+    all_ci.append(df_ci)
+
+df_raw_all = pd.concat(all_raw, axis=0, ignore_index=True)
+df_ci_all  = pd.concat(all_ci,  axis=0, ignore_index=True)
+
+RAW_OUT = os.path.join(OUT_DIR, "mc_raw_GLOBAL_NH_greenup_methodEnsemble.csv")
+CI_OUT  = os.path.join(OUT_DIR,  "mc_ci_GLOBAL_NH_greenup_methodEnsemble.csv")
+df_raw_all.to_csv(RAW_OUT, index=False)
+df_ci_all.to_csv(CI_OUT, index=False)
+print("✅ Saved:")
+print(" -", RAW_OUT)
+print(" -", CI_OUT)
+
+# =========================
+# 10) Print key numeric results (for base)
+# =========================
+def print_key_numbers(df_ci_all, setting="base", deltas=(10, 30)):
+    sub = df_ci_all[df_ci_all["setting"] == setting].copy()
+    for d in deltas:
+        r = sub[sub["delta_days"] == d]
+        if r.empty:
+            continue
+        r = r.iloc[0]
+        print(f"\n=== Setting={setting} | delta={d} days ===")
+        print(f"Δ Warm-season P95 LST: {r['d_warm_p95_mean']:.4f}  [{r['d_warm_p95_lo']:.4f}, {r['d_warm_p95_hi']:.4f}]")
+        print(f"Δ Heat exposure integral: {r['d_heat_expo_mean']:.4f}  [{r['d_heat_expo_lo']:.4f}, {r['d_heat_expo_hi']:.4f}]")
+        print(f"Δ Peak timing (days): {r['d_peak_time_mean']:.4f}  [{r['d_peak_time_lo']:.4f}, {r['d_peak_time_hi']:.4f}]")
+
+print_key_numbers(df_ci_all, setting="base", deltas=(10, 30))
+
+# =========================
+# 11) Plot: 3 panels for "base" (sampling uncertainty shading)
+# =========================
+def plot_three_panels(df_ci_all, setting="base"):
+    df = df_ci_all[df_ci_all["setting"] == setting].sort_values("delta_days")
+    x = df["delta_days"].values
+
+    panels = [
+        ("d_warm_p95",  "Warm-season P95 ΔLST (DOY160–240)", "ΔLST (°C)"),
+        ("d_heat_expo", "Heat exposure integral Δ", "Δ (°C·day)"),
+        ("d_peak_time", "Δ peak timing (robust, circular)", "ΔDOY (days)")
+    ]
+
+    fig, axes = plt.subplots(3, 1, figsize=(7.0, 6.2), sharex=True, gridspec_kw={"hspace":0.55})
+    for i,(key,title,ylab) in enumerate(panels):
+        ax = axes[i]
+        m  = df[f"{key}_mean"].values
+        lo = df[f"{key}_lo"].values
+        hi = df[f"{key}_hi"].values
+
+        ax.fill_between(x, lo, hi, alpha=0.18, linewidth=0)
+        ax.plot(x, m, linewidth=2.2)
+        ax.axhline(0, linestyle="--", linewidth=1, color="black", alpha=0.7)
+
+        ax.set_title(title, pad=10)
+        ax.set_ylabel(ylab)
+
+        ax.text(-0.10, 1.03, chr(65+i), transform=ax.transAxes, fontsize=12, fontweight="bold")
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+
+    axes[-1].set_xlabel("EVI + LAI advance (days)")
+    fig.suptitle(f"GLOBAL (NH-like) | green-up advance in spring window | setting={setting}", y=0.995, fontsize=11)
+    plt.tight_layout()
+    plt.show()
+
+plot_three_panels(df_ci_all, setting="base")
+
+# =========================
+# 12) Plot method uncertainty band across settings (10–90% envelope of means)
+# =========================
+def plot_method_uncertainty_band(df_ci_all):
+    metrics = ["d_warm_p95","d_heat_expo","d_peak_time"]
+    titles  = {
+        "d_warm_p95":"Warm-season P95 ΔLST (DOY160–240)",
+        "d_heat_expo":"Heat exposure integral Δ",
+        "d_peak_time":"Δ peak timing (robust, circular)"
+    }
+    ylabs = {
+        "d_warm_p95":"ΔLST (°C)",
+        "d_heat_expo":"Δ (°C·day)",
+        "d_peak_time":"ΔDOY (days)"
+    }
+
+    fig, axes = plt.subplots(3, 1, figsize=(7.0, 6.2), sharex=True, gridspec_kw={"hspace":0.55})
+
+    for i,key in enumerate(metrics):
+        ax = axes[i]
+        g = df_ci_all.pivot_table(index="delta_days", columns="setting", values=f"{key}_mean")
+        x = g.index.values.astype(float)
+        vals = g.values
+
+        q10 = np.nanpercentile(vals, 10, axis=1)
+        q90 = np.nanpercentile(vals, 90, axis=1)
+        med = np.nanmedian(vals, axis=1)
+
+        ax.fill_between(x, q10, q90, alpha=0.18, linewidth=0)
+        ax.plot(x, med, linewidth=2.2)
+        ax.axhline(0, linestyle="--", linewidth=1, color="black", alpha=0.7)
+
+        ax.set_title(titles[key], pad=10)
+        ax.set_ylabel(ylabs[key])
+        ax.text(-0.10, 1.03, chr(65+i), transform=ax.transAxes, fontsize=12, fontweight="bold")
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+
+    axes[-1].set_xlabel("EVI + LAI advance (days)")
+    fig.suptitle("Method uncertainty across settings (10–90% band of mean responses)", y=0.995, fontsize=11)
+    plt.tight_layout()
+    plt.show()
+
+plot_method_uncertainty_band(df_ci_all)
+
+# -*- coding: utf-8 -*-
+"""
+GLOBAL (NH) | spring green-up advance (EVI+LAI) | CatBoost + Monte Carlo
++ Placebo (OPT): Random-window placebo (same operator, random season window with same length)
+
+What you need to set:
+- MODEL_PATH
+- CHANNELS_NPY (recommended)
+- TYPICAL_CSV
+
+Outputs:
+- df_all (raw, includes kind=main/placebo)
+- df_g   (GLOBAL summary, includes kind=main/placebo)
+- A Nature-style 2-panel figure (Warm-season P95 ΔLST, Heat exposure integral Δ), legend outside
+
+Notes:
+- "Peak" is computed robustly (top-k) to avoid argmax instability.
+- NH filter is NH-like at clim_major level (because typical curves are aggregated by clim_major).
+"""
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from catboost import CatBoostRegressor
+
+# ============================================================
+# 0) Paths
+# ============================================================
+MODEL_PATH   = "/content/GZ_model_20260305_032709/catboost_model.cbm"
+CHANNELS_NPY = "/content/GZ_model_20260305_032709/channels.npy"  # strongly recommended
+TYPICAL_CSV  = "/content/drive/MyDrive/anature_revised/typical_timeseries_fast.csv"
+
+OUT_RAW = "/content/drive/MyDrive/anature_revised/mc_raw_GLOBAL_NH_greenup_main_plus_placebo.csv"
+OUT_CI  = "/content/drive/MyDrive/anature_revised/mc_ci_GLOBAL_NH_greenup_main_plus_placebo.csv"
+OUT_FIG = "/content/drive/MyDrive/anature_revised/Fig_placebo_main_2panels.png"
+
+# ============================================================
+# 1) Core settings
+# ============================================================
+T = 46
+DT_DAYS = 8.0
+
+DELTA_DAYS_LIST = list(range(0, 31, 1))  # 0..30 by 1 day
+N_MC_PER_GROUP  = 100
+RANDOM_SEED     = 42
+
+HEMISPHERE_MODE = "NH"       # "NH" or "GLOBAL"
+GREENUP_DOY     = (60, 180)  # spring window for NH
+BLEND_STEPS     = 2          # boundary blending steps (0/1/2)
+
+# Monte Carlo synthesis
+AR1_RHO          = 0.90
+NOISE_SCALE      = 0.55
+CLIP_TO_P_BOUNDS = True
+
+# Global summary CI
+CI_MODE   = "sem"      # "sem" or "percentile"
+CI_ALPHA  = 0.05
+WINSORIZE = True
+WINSOR_Q_LO = 2.5
+WINSOR_Q_HI = 97.5
+
+GLOBAL_WEIGHT_MODE = "equal"  # "equal" or "by_ncity" (if city column exists)
+
+# Metrics
+WARM_DOY = (160, 240)
+
+# Robust peak (important)
+ROBUST_PEAK_MODE = "topk"   # "topk" or "pctl"
+ROBUST_TOPK      = 3
+ROBUST_PCTL      = 99
+
+SHIFT_VARS_MODEL = ["EVI.EVI", "LAI.LAI"]
+
+# Noise multipliers (vegetation > climate, static ~0)
+NOISE_MULT = {
+    "EVI.EVI": 0.45,
+    "LAI.LAI": 0.40,
+    "ERA5LMAIN.SSRD": 0.12,
+    "ERA5LMAIN.VPD":  0.12,
+    "ERA5LMAIN.TP":   0.10,
+    "ERA5LMAIN.SWVL1":0.10,
+    "ERA5LMAIN.WIND10M":0.10,
+    "ERA5LMAIN.T2M":  0.08,
+    "ERA5LMAIN.TD":   0.08,
+    "ERA5LMAIN.STL1": 0.08,
+    "NTL.NTL": 0.02,
+    "DEM.DEM": 0.00,
+    "MODIS.LC":0.00,
+}
+DEFAULT_NOISE_MULT = 0.08
+
+# Plot styling
+LINE_MAIN   = "#1f77b4"   # blue
+LINE_PLCB   = "#7f7f7f"   # gray
+SHADE_ALPHA = 0.15
+FIGSIZE     = (6.8, 4.8)  # Nature-ish single-column width ~6.8 in
+
+
+# ============================================================
+# 2) Small utilities
+# ============================================================
+def _infer_cols(df):
+    cols = set(df.columns.str.lower())
+    is_long = ("clim_major" in cols) and (("var" in cols) or ("variable" in cols))
+    return "long" if is_long else "wide"
+
+def _resample_to_T(x, T=46):
+    x = np.asarray(x, dtype=float)
+    n = len(x)
+    if n == T:
+        return x.copy()
+    if n < 2:
+        return np.full(T, np.nan)
+    t0 = np.linspace(0, 1, n)
+    t1 = np.linspace(0, 1, T)
+    return np.interp(t1, t0, x)
+
+def stable_seed(key, mc, base_seed=42):
+    s = str(key)
+    h = 2166136261
+    for ch in s:
+        h ^= ord(ch)
+        h = (h * 16777619) & 0xFFFFFFFF
+    return (base_seed + (h % 100000) * 1000 + mc) % (2**32 - 1)
+
+def doys_from_steps(T=46, dt_days=8.0):
+    return np.arange(T) * dt_days + dt_days/2.0
+
+def circular_diff(a, b, period=365.0):
+    d = (a - b) % period
+    if d > period/2:
+        d -= period
+    return d
+
+def ar1_noise(T, sigma, rho=0.9, rng=None):
+    rng = np.random.default_rng() if rng is None else rng
+    if (not np.isfinite(sigma)) or sigma <= 0:
+        return np.zeros(T, dtype=float)
+    eps = rng.normal(0, 1, size=T)
+    x = np.zeros(T, dtype=float)
+    x[0] = rng.normal(0, sigma)
+    innov = sigma * np.sqrt(max(1e-8, 1 - rho**2))
+    for t in range(1, T):
+        x[t] = rho * x[t-1] + innov * eps[t]
+    return x
+
+def winsorize(arr, qlo=2.5, qhi=97.5):
+    arr = np.asarray(arr, dtype=float)
+    lo = np.nanpercentile(arr, qlo)
+    hi = np.nanpercentile(arr, qhi)
+    return np.clip(arr, lo, hi)
+
+
+# ============================================================
+# 3) Robust peak metrics
+# ============================================================
+def robust_peak_value(x, mode="topk", topk=3, pctl=99):
+    x = np.asarray(x, float)
+    m = np.isfinite(x)
+    if m.sum() == 0:
+        return np.nan
+    xv = x[m]
+    if mode == "pctl":
+        return float(np.nanpercentile(xv, pctl))
+    k = int(max(1, min(topk, len(xv))))
+    idx = np.argsort(xv)[-k:]
+    return float(np.nanmean(xv[idx]))
+
+def robust_peak_time_doy(x, dt_days=8.0, mode="topk", topk=3, pctl=99):
+    x = np.asarray(x, float)
+    doys = doys_from_steps(len(x), dt_days)
+    m = np.isfinite(x)
+    if m.sum() == 0:
+        return np.nan
+    xv = x[m]
+    dv = doys[m]
+    if mode == "pctl":
+        thr = np.nanpercentile(xv, pctl)
+        sel = xv >= thr
+        if sel.sum() >= 2:
+            return float(np.nanmean(dv[sel]))
+    k = int(max(1, min(topk, len(xv))))
+    idx = np.argsort(xv)[-k:]
+    return float(np.nanmean(dv[idx]))
+
+def compute_metrics(lst_series, warm_doy=WARM_DOY, dt_days=8.0):
+    x = np.asarray(lst_series, dtype=float)
+    doys = doys_from_steps(len(x), dt_days)
+
+    peak_time = robust_peak_time_doy(
+        x, dt_days=dt_days,
+        mode=ROBUST_PEAK_MODE, topk=ROBUST_TOPK, pctl=ROBUST_PCTL
+    )
+    peak_val = robust_peak_value(
+        x, mode=ROBUST_PEAK_MODE, topk=ROBUST_TOPK, pctl=ROBUST_PCTL
+    )
+
+    m = (doys >= warm_doy[0]) & (doys <= warm_doy[1])
+    xw = x[m]
+    warm_mean = float(np.nanmean(xw))
+    warm_p90  = float(np.nanpercentile(xw, 90))
+    warm_p95  = float(np.nanpercentile(xw, 95))
+
+    thr = float(np.nanmedian(xw))
+    excess = np.maximum(0, xw - thr)
+    heat_expo = float(np.nansum(excess) * dt_days)
+
+    return dict(
+        peak_time_doy=peak_time,
+        peak_value=peak_val,
+        warm_mean=warm_mean,
+        warm_p90=warm_p90,
+        warm_p95=warm_p95,
+        heat_expo=heat_expo
+    )
+
+
+# ============================================================
+# 4) Counterfactual operator: advance within a window (no-wrap + blend)
+# ============================================================
+def shift_within_window_no_wrap(x_seg, advance_days, dt_days=8.0):
+    x_seg = np.asarray(x_seg, dtype=float)
+    L = len(x_seg)
+    if L <= 1 or advance_days <= 0:
+        return x_seg.copy()
+
+    s = advance_days / dt_days
+    k = np.arange(L, dtype=float)
+    src = np.clip(k + s, 0, L - 1)
+
+    i0 = np.floor(src).astype(int)
+    i1 = np.clip(i0 + 1, 0, L - 1)
+    w = src - i0
+    return (1 - w) * x_seg[i0] + w * x_seg[i1]
+
+def greenup_advance(x, advance_days, window_doy=(60, 180), dt_days=8.0, blend_steps=2):
+    x = np.asarray(x, dtype=float)
+    Tloc = len(x)
+    if advance_days <= 0:
+        return x.copy()
+
+    doys = doys_from_steps(Tloc, dt_days)
+    m = (doys >= window_doy[0]) & (doys <= window_doy[1])
+    idx = np.where(m)[0]
+    if len(idx) < 3:
+        return x.copy()
+
+    i0, i1 = int(idx[0]), int(idx[-1])
+    seg = x[i0:i1+1]
+    seg_shift = shift_within_window_no_wrap(seg, advance_days, dt_days=dt_days)
+
+    y = x.copy()
+    y[i0:i1+1] = seg_shift
+
+    b = int(max(0, blend_steps))
+    if b > 0:
+        l0 = max(0, i0 - b)
+        for t in range(l0, i0):
+            w = (t - l0 + 1) / (i0 - l0 + 1)
+            y[t] = (1 - w) * x[t] + w * y[t]
+
+        r1 = min(Tloc - 1, i1 + b)
+        for t in range(i1 + 1, r1 + 1):
+            w = (r1 - t + 1) / (r1 - (i1 + 1) + 1)
+            y[t] = (1 - w) * x[t] + w * y[t]
+
+    return y
+
+
+# ============================================================
+# 5) Placebo-OPT: random-window placebo (same length as spring window)
+# ============================================================
+def window_mask_from_doy(T, dt_days, window_doy):
+    doys = doys_from_steps(T, dt_days)
+    m = (doys >= window_doy[0]) & (doys <= window_doy[1])
+    idx = np.where(m)[0]
+    if len(idx) == 0:
+        return None
+    return int(idx[0]), int(idx[-1])
+
+def random_window_same_length(rng, ref_window_doy=(60, 180), T=46, dt_days=8.0):
+    ref = window_mask_from_doy(T, dt_days, ref_window_doy)
+    if ref is None:
+        return ref_window_doy
+
+    i0, i1 = ref
+    L = i1 - i0 + 1
+
+    s0 = int(rng.integers(0, max(1, T - L + 1)))
+    s1 = s0 + L - 1
+
+    doys = doys_from_steps(T, dt_days)
+    doy_start = float(doys[s0] - dt_days/2.0)
+    doy_end   = float(doys[s1] + dt_days/2.0)
+    return (doy_start, doy_end)
+
+def build_X1_main(X0, d, feat2idx):
+    X1 = X0.copy()
+    for ch in SHIFT_VARS_MODEL:
+        if ch in feat2idx:
+            j = feat2idx[ch]
+            X1[:, j] = greenup_advance(
+                X1[:, j], advance_days=d,
+                window_doy=GREENUP_DOY,
+                dt_days=DT_DAYS, blend_steps=BLEND_STEPS
+            ).astype(np.float32)
+    return X1
+
+def build_X1_placebo_randomwindow(X0, d, feat2idx, rng):
+    X1 = X0.copy()
+    placebo_win = random_window_same_length(
+        rng, ref_window_doy=GREENUP_DOY, T=X0.shape[0], dt_days=DT_DAYS
+    )
+    for ch in SHIFT_VARS_MODEL:
+        if ch in feat2idx:
+            j = feat2idx[ch]
+            X1[:, j] = greenup_advance(
+                X1[:, j], advance_days=d,
+                window_doy=placebo_win,
+                dt_days=DT_DAYS, blend_steps=BLEND_STEPS
+            ).astype(np.float32)
+    return X1
+
+
+# ============================================================
+# 6) Mapping: typical vars -> model channels
+# ============================================================
+MAP_TYPICAL_TO_MODEL = {
+    "DEM": "DEM.DEM",
+    "NTL": "NTL.NTL",
+    "LC":  "MODIS.LC",
+    "EVI": "EVI.EVI",
+    "LAI": "LAI.LAI",
+    "ERA5_SSRD":   "ERA5LMAIN.SSRD",
+    "ERA5_TP":     "ERA5LMAIN.TP",
+    "ERA5_SWVL1":  "ERA5LMAIN.SWVL1",
+    "ERA5_VPD":    "ERA5LMAIN.VPD",
+    "ERA5_WIND10M":"ERA5LMAIN.WIND10M",
+    "ERA5_T2M":    "ERA5LMAIN.T2M",
+    "ERA5_TD":     "ERA5LMAIN.TD",
+    "ERA5_STL1":   "ERA5LMAIN.STL1",
+}
+
+
+# ============================================================
+# 7) Load model + channels
+# ============================================================
+model = CatBoostRegressor()
+model.load_model(MODEL_PATH)
+print("✅ Model loaded:", MODEL_PATH)
+
+if CHANNELS_NPY and os.path.exists(CHANNELS_NPY):
+    channels = np.load(CHANNELS_NPY, allow_pickle=True).tolist()
+else:
+    raise RuntimeError("❌ Please provide CHANNELS_NPY (channels.npy).")
+
+feat2idx = {c:i for i,c in enumerate(channels)}
+print("Model expects:", channels)
+
+
+# ============================================================
+# 8) Load typical csv -> lib; NH-like filtering
+# ============================================================
+df_typ = pd.read_csv(TYPICAL_CSV)
+if _infer_cols(df_typ) != "long":
+    raise RuntimeError("❌ typical_timeseries_fast.csv must be long-form: clim_major/var/step/...")
+
+cols = {c.lower(): c for c in df_typ.columns}
+clim_col = cols.get("clim_major", "clim_major")
+var_col  = cols.get("var", cols.get("variable", "var"))
+step_col = cols.get("step", "step")
+
+# central tendency
+mu_col = None
+for cand in ["mu", "p50", "median", "mean"]:
+    if cand in cols:
+        mu_col = cols[cand]
+        break
+if mu_col is None:
+    raise RuntimeError("❌ typical csv missing mu/p50/median/mean.")
+
+# spread and bounds
+sg_col  = None
+for cand in ["sigma_robust", "sigma", "std"]:
+    if cand in cols:
+        sg_col = cols[cand]
+        break
+
+p05_col = cols.get("p05", None)
+p95_col = cols.get("p95", None)
+p10_col = cols.get("p10", None)
+p90_col = cols.get("p90", None)
+
+lib = {}
+ncity_by_clim = {}
+
+for clim, g in df_typ.groupby(df_typ[clim_col]):
+    lib[clim] = {}
+    ncity_by_clim[clim] = int(g.get("city", pd.Series(dtype=object)).nunique()) if "city" in g.columns else 1
+
+    for var, gg in g.groupby(g[var_col]):
+        v = str(var)
+        model_ch = MAP_TYPICAL_TO_MODEL.get(v, v)
+        if model_ch not in feat2idx:
+            continue
+
+        gg = gg.sort_values(step_col)
+        mu = _resample_to_T(gg[mu_col].values, T)
+
+        # sigma
+        if sg_col is not None:
+            sg = _resample_to_T(gg[sg_col].values, T)
+        elif (p10_col is not None) and (p90_col is not None):
+            p10 = _resample_to_T(gg[p10_col].values, T)
+            p90 = _resample_to_T(gg[p90_col].values, T)
+            sg = (p90 - p10) / 2.563  # normal approx
+        else:
+            sg = np.full(T, 0.05)
+
+        # bounds
+        if (p05_col is not None) and (p95_col is not None):
+            plo = _resample_to_T(gg[p05_col].values, T)
+            phi = _resample_to_T(gg[p95_col].values, T)
+        elif (p10_col is not None) and (p90_col is not None):
+            plo = _resample_to_T(gg[p10_col].values, T)
+            phi = _resample_to_T(gg[p90_col].values, T)
+        else:
+            plo = mu - 1.0 * sg
+            phi = mu + 1.0 * sg
+
+        lib[clim][model_ch] = dict(mu=mu, sigma=sg, plo=plo, phi=phi)
+
+print("✅ Clim groups (raw):", sorted(lib.keys()))
+
+def infer_hemisphere_from_evi_peak(clim_key):
+    ch = "EVI.EVI"
+    if clim_key not in lib or ch not in lib[clim_key]:
+        return "UNK"
+    mu = lib[clim_key][ch]["mu"]
+    doys = doys_from_steps(len(mu), DT_DAYS)
+    peak_doy = float(doys[int(np.nanargmax(mu))])  # only for hemi inference
+    return "NH" if peak_doy <= 200 else "SH"
+
+if HEMISPHERE_MODE == "NH":
+    hemi_by_clim = {c: infer_hemisphere_from_evi_peak(c) for c in lib.keys()}
+    keep = [c for c,h in hemi_by_clim.items() if h == "NH"]
+    lib = {c: lib[c] for c in keep}
+    ncity_by_clim = {c: ncity_by_clim.get(c, 1) for c in keep}
+    print("✅ Keep NH-like clim groups:", keep)
+else:
+    print("✅ Using GLOBAL (no hemisphere filtering).")
+
+if len(lib) == 0:
+    raise RuntimeError("❌ No clim groups left after NH-like filtering.")
+
+
+# ============================================================
+# 9) Generate MC baseline time series (per clim)
+# ============================================================
+def gen_one_ts_for_clim(clim, rng):
+    X = np.zeros((T, len(channels)), dtype=np.float32)
+    for j, ch in enumerate(channels):
+        if (clim in lib) and (ch in lib[clim]):
+            mu  = lib[clim][ch]["mu"]
+            sg  = lib[clim][ch]["sigma"]
+            plo = lib[clim][ch]["plo"]
+            phi = lib[clim][ch]["phi"]
+
+            mult = NOISE_MULT.get(ch, DEFAULT_NOISE_MULT)
+            sigma0 = float(np.nanmedian(sg)) * NOISE_SCALE * float(mult)
+            x = mu + ar1_noise(T, sigma=sigma0, rho=AR1_RHO, rng=rng)
+
+            if CLIP_TO_P_BOUNDS:
+                x = np.minimum(np.maximum(x, plo), phi)
+
+            X[:, j] = x.astype(np.float32)
+        else:
+            X[:, j] = 0.0
+    return X
+
+def predict_lst_series(X_ts):
+    return model.predict(X_ts).astype(np.float32)
+
+
+# ============================================================
+# 10) Monte Carlo: main + placebo
+# ============================================================
+def run_mc_global_main_plus_placebo():
+    rows = []
+    for clim in sorted(lib.keys()):
+        print(f"== MC clim={clim} ==")
+        for mc in range(N_MC_PER_GROUP):
+            rng0 = np.random.default_rng(stable_seed(clim, mc, base_seed=RANDOM_SEED))
+
+            X0 = gen_one_ts_for_clim(clim, rng=rng0)
+            y0 = predict_lst_series(X0)
+            m0 = compute_metrics(y0, dt_days=DT_DAYS)
+
+            for d in DELTA_DAYS_LIST:
+                # ---- main
+                X1_main = build_X1_main(X0, d, feat2idx)
+                y1_main = predict_lst_series(X1_main)
+                m1_main = compute_metrics(y1_main, dt_days=DT_DAYS)
+
+                rows.append({
+                    "kind": "main",
+                    "clim": clim,
+                    "mc": mc,
+                    "delta_days": int(d),
+                    "d_peak_time": circular_diff(m1_main["peak_time_doy"], m0["peak_time_doy"], period=365.0),
+                    "d_peak_lst":  (m1_main["peak_value"] - m0["peak_value"]),
+                    "d_warm_mean": (m1_main["warm_mean"]  - m0["warm_mean"]),
+                    "d_warm_p90":  (m1_main["warm_p90"]   - m0["warm_p90"]),
+                    "d_warm_p95":  (m1_main["warm_p95"]   - m0["warm_p95"]),
+                    "d_heat_expo": (m1_main["heat_expo"]  - m0["heat_expo"]),
+                })
+
+                # ---- placebo (random window, same length)
+                rng_pl = np.random.default_rng(stable_seed(f"{clim}_pl_{d}", mc, base_seed=RANDOM_SEED))
+                X1_pl  = build_X1_placebo_randomwindow(X0, d, feat2idx, rng=rng_pl)
+                y1_pl  = predict_lst_series(X1_pl)
+                m1_pl  = compute_metrics(y1_pl, dt_days=DT_DAYS)
+
+                rows.append({
+                    "kind": "placebo_randomwin",
+                    "clim": clim,
+                    "mc": mc,
+                    "delta_days": int(d),
+                    "d_peak_time": circular_diff(m1_pl["peak_time_doy"], m0["peak_time_doy"], period=365.0),
+                    "d_peak_lst":  (m1_pl["peak_value"] - m0["peak_value"]),
+                    "d_warm_mean": (m1_pl["warm_mean"]  - m0["warm_mean"]),
+                    "d_warm_p90":  (m1_pl["warm_p90"]   - m0["warm_p90"]),
+                    "d_warm_p95":  (m1_pl["warm_p95"]   - m0["warm_p95"]),
+                    "d_heat_expo": (m1_pl["heat_expo"]  - m0["heat_expo"]),
+                })
+
+    return pd.DataFrame(rows)
+
+df_all = run_mc_global_main_plus_placebo()
+print("✅ df_all:", df_all.shape)
+
+
+# ============================================================
+# 11) GLOBAL summary (by kind)
+# ============================================================
+def weighted_quantile(values, quantiles, sample_weight=None):
+    values = np.asarray(values, dtype=float)
+    quantiles = np.asarray(quantiles, dtype=float)
+    if sample_weight is None:
+        return np.quantile(values, quantiles)
+
+    w = np.asarray(sample_weight, dtype=float)
+    mask = np.isfinite(values) & np.isfinite(w)
+    values = values[mask]
+    w = w[mask]
+    if len(values) == 0:
+        return np.full_like(quantiles, np.nan, dtype=float)
+
+    sorter = np.argsort(values)
+    values = values[sorter]
+    w = w[sorter]
+    cdf = np.cumsum(w) - 0.5*w
+    cdf /= np.sum(w)
+    return np.interp(quantiles, cdf, values)
+
+def summarize_global_by_kind(df_all, ncity_by_clim, mode="equal"):
+    metrics = ["d_peak_time","d_peak_lst","d_warm_mean","d_warm_p90","d_warm_p95","d_heat_expo"]
+    out = []
+    z = 1.96  # ~95%
+
+    for (kind, d), g in df_all.groupby(["kind", "delta_days"]):
+        if mode == "equal":
+            w = np.ones(len(g), dtype=float)
+        else:
+            w = g["clim"].map(lambda c: max(1.0, float(ncity_by_clim.get(c, 1)))).values
+
+        row = {"kind": kind, "clim": "GLOBAL", "delta_days": int(d), "n": int(len(g))}
+
+        for m in metrics:
+            vals = g[m].values.astype(float)
+
+            if CI_MODE == "percentile" and WINSORIZE:
+                vals = winsorize(vals, WINSOR_Q_LO, WINSOR_Q_HI)
+
+            mean = float(np.average(vals, weights=w))
+            row[m+"_mean"] = mean
+
+            if CI_MODE == "sem":
+                var = float(np.average((vals - mean)**2, weights=w))
+                std = np.sqrt(max(1e-12, var))
+                sem = std / np.sqrt(len(vals))
+                row[m+"_lo"] = mean - z * sem
+                row[m+"_hi"] = mean + z * sem
+            else:
+                qlo = CI_ALPHA/2
+                qhi = 1 - CI_ALPHA/2
+                lo, hi = weighted_quantile(vals, [qlo, qhi], sample_weight=w)
+                row[m+"_lo"] = float(lo)
+                row[m+"_hi"] = float(hi)
+
+        out.append(row)
+
+    return pd.DataFrame(out).sort_values(["kind","delta_days"]).reset_index(drop=True)
+
+df_g = summarize_global_by_kind(df_all, ncity_by_clim, mode=GLOBAL_WEIGHT_MODE)
+print("✅ df_g:", df_g.shape)
+
+
+# ============================================================
+# 12) Plot (2 panels, legend outside)
+# ============================================================
+def plot_two_panels_main_vs_placebo(df_g):
+    x = np.sort(df_g["delta_days"].unique()).astype(float)
+
+    def get_curve(kind, key):
+        sub = df_g[df_g["kind"] == kind].sort_values("delta_days")
+        return (sub["delta_days"].values.astype(float),
+                sub[f"{key}_mean"].values.astype(float),
+                sub[f"{key}_lo"].values.astype(float),
+                sub[f"{key}_hi"].values.astype(float))
+
+    kinds = [("main", LINE_MAIN, "Main (spring window)"),
+             ("placebo_randomwin", LINE_PLCB, "Placebo (random window)")]
+
+    fig, axes = plt.subplots(2, 1, figsize=FIGSIZE, sharex=True, gridspec_kw={"hspace":0.42})
+
+    panels = [
+        ("d_warm_p95", "Warm-season P95 ΔLST (DOY160–240)", "ΔLST (°C)"),
+        ("d_heat_expo","Heat exposure integral Δ",          "Δ (°C·day)")
+    ]
+
+    for ax, (key, ttl, ylab) in zip(axes, panels):
+        for kind, color, lab in kinds:
+            xx, m, lo, hi = get_curve(kind, key)
+            ax.fill_between(xx, lo, hi, color=color, alpha=SHADE_ALPHA, linewidth=0)
+            ax.plot(xx, m, color=color, linewidth=2.2, label=lab)
+
+        ax.axhline(0, linestyle="--", linewidth=1.0, color="black", alpha=0.7)
+        ax.set_title(ttl, pad=10)
+        ax.set_ylabel(ylab)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+
+    axes[-1].set_xlabel("EVI + LAI advance (days)")
+
+    # Legend outside (right)
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="center left", bbox_to_anchor=(1.01, 0.5), frameon=False)
+
+    fig.suptitle("GLOBAL (NH) | Counterfactual spring green-up advance (climate fixed)", y=0.99, fontsize=11)
+    plt.tight_layout()
+    plt.savefig(OUT_FIG, dpi=300, bbox_inches="tight")
+    plt.show()
+
+plot_two_panels_main_vs_placebo(df_g)
+
+
+# ============================================================
+# 13) Save outputs + quick sanity numbers
+# ============================================================
+df_all.to_csv(OUT_RAW, index=False)
+df_g.to_csv(OUT_CI, index=False)
+
+print("✅ Saved:")
+print(" -", OUT_RAW)
+print(" -", OUT_CI)
+print(" -", OUT_FIG)
+
+def print_sanity(df_g, delta=10, key="d_warm_p95", kind="main"):
+    sub = df_g[(df_g["kind"]==kind) & (df_g["delta_days"]==delta)]
+    if sub.empty:
+        print(f"[SANITY] missing kind={kind}, delta={delta}")
+        return
+    r = sub.iloc[0]
+    print(f"\n=== kind={kind} | delta={delta} days ===")
+    print(f"{key}: {r[key+'_mean']:.4f} [{r[key+'_lo']:.4f}, {r[key+'_hi']:.4f}]  (n={int(r['n'])})")
+
+print_sanity(df_g, delta=10, key="d_warm_p95", kind="main")
+print_sanity(df_g, delta=10, key="d_warm_p95", kind="placebo_randomwin")
+print_sanity(df_g, delta=30, key="d_heat_expo", kind="main")
+print_sanity(df_g, delta=30, key="d_heat_expo", kind="placebo_randomwin")
