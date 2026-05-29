@@ -1,0 +1,101 @@
+City,Country,Lat,Lon,Climate,Population,Group,Continent,Climate_zone,Division,centerX,centerY,City size (km2),City population size (ind.)
+Pearl River Delta Metropolitan Region,CHN,22.93484,113.5643,Temperate,37760891.35,Temperate,Asia,Temperate,Global South,113.5643,22.93484,10665,37760891.35
+Shanghai,CHN,31.13422,121.455,Temperate,23715573.9,Temperate,Asia,Temperate,Global South,121.455,31.13422,4377.125,23715573.9
+Tokyo,JPN,35.69626,139.643,Temperate,22490873.62,Temperate,Asia,Temperate,Global North,139.643,35.69626,4241.208,22490873.62
+Sao Paulo,BRA,-23.5627,-46.5909,Temperate,16739870.98,Temperate,Latin America and the Caribbean,Temperate,Global South,-46.5909,-23.5627,2087.376,16739870.98
+Mexico City-La Laguna,MEX,19.46855,-99.1061,Temperate,16330619.39,Temperate,Latin America and the Caribbean,Temperate,Global South,-99.1061,19.46855,1894.961,16330619.39
+Los Angeles-Long Beach-Riverside-San Bernardino,USA,33.95922,-117.906,Temperate,14240248.84,Temperate,Northern America,Temperate,Global North,-117.906,33.95922,8588.459,14240248.84
+Istanbul,TUR,40.983,29.05127,Temperate,11763945.91,Temperate,Asia,Temperate,Global North,29.05127,40.983,1395.051,11763945.91
+Ekurhuleni-Johannesburg-Pretoria,ZAF,-26.0123,28.12444,Temperate,10979603.48,Temperate,Africa,Temperate,Global South,28.12444,-26.0123,4498.216,10979603.48
+Osaka,JPN,34.71036,135.5363,Temperate,9920958.053,Temperate,Asia,Temperate,Global North,135.5363,34.71036,1647.886,9920958.053
+Paris,FRA,48.83609,2.35431,Temperate,9029927.158,Temperate,Europe,Temperate,Global North,2.35431,48.83609,2765.02,9029927.158
+London,GBR,51.5018,-0.14115,Temperate,8838110.592,Temperate,Europe,Temperate,Global North,-0.14115,51.5018,2839.667,8838110.592
+Quanzhou-Xiamen,CHN,24.70643,118.2809,Temperate,8660205.05,Temperate,Asia,Temperate,Global South,118.2809,24.70643,2594.09,8660205.05
+Wuhan,CHN,30.53425,114.3062,Temperate,6982360.314,Temperate,Asia,Temperate,Global South,114.3062,30.53425,1294.525,6982360.314
+Bogota,COL,4.638822,-74.1179,Temperate,6858835.977,Temperate,Latin America and the Caribbean,Temperate,Global South,-74.1179,4.638822,382.4196,6858835.977
+Taibei-Taoyuan-Xinbei,CHN,25.01158,121.3541,Temperate,6615250.135,Temperate,Asia,Temperate,Global South,121.3541,25.01158,949.3882,6615250.135
+Chengdu,CHN,30.68062,104.0516,Temperate,6308844.38,Temperate,Asia,Temperate,Global South,104.0516,30.68062,1690.278,6308844.38
+Nanjing,CHN,32.04691,118.7941,Temperate,5248802.204,Temperate,Asia,Temperate,Global South,118.7941,32.04691,1392.435,5248802.204
+Houston,USA,29.78762,-95.4121,Temperate,5198377.276,Temperate,Northern America,Temperate,Global North,-95.4121,29.78762,5158.231,5198377.276
+Santiago,CHL,-33.4775,-70.6608,Temperate,5184892.01,Temperate,Latin America and the Caribbean,Temperate,Global North,-70.6608,-33.4775,812.7255,5184892.01
+San Francisco-Oakland-San Jose,USA,37.6368,-122.065,Temperate,4969388.058,Temperate,Northern America,Temperate,Global North,-122.065,37.6368,2878.141,4969388.058
+Barcelona,ESP,41.3783,1.839475,Temperate,4963827.528,Temperate,Europe,Temperate,Global North,1.839475,41.3783,2123.349,4963827.528
+Dallas-Fort Worth,USA,32.84967,-96.9649,Temperate,4873005.121,Temperate,Northern America,Temperate,Global North,-96.9649,32.84967,5581.361,4873005.121
+Ruian-Wenzhou,CHN,27.78407,120.6263,Temperate,4490531.22,Temperate,Asia,Temperate,Global South,120.6263,27.78407,812.9843,4490531.22
+Guadalajara,MEX,20.6409,-103.357,Temperate,4114685.967,Temperate,Latin America and the Caribbean,Temperate,Global South,-103.357,20.6409,609.6745,4114685.967
+Chongqing,CHN,29.5819,106.5329,Temperate,3752946.667,Temperate,Asia,Temperate,Global South,106.5329,29.5819,636.5804,3752946.667
+Napoli,ITA,40.85954,14.43049,Temperate,3693365.222,Temperate,Europe,Temperate,Global North,14.43049,40.85954,2133.137,3693365.222
+Kathmandu,NPL,27.70032,85.32738,Temperate,3681310.685,Temperate,Asia,Temperate,Global South,85.32738,27.70032,112.498,3681310.685
+Milano,ITA,45.57266,9.124526,Temperate,3668308.005,Temperate,Europe,Temperate,Global North,9.124526,45.57266,1624.573,3668308.005
+Cape Town,ZAF,-33.9676,18.60332,Temperate,3607970.869,Temperate,Africa,Temperate,Global South,18.60332,-33.9676,979.6314,3607970.869
+"Baltimore-Washington, D.C.",USA,39.11949,-76.82,Temperate,3526814,Temperate,Northern America,Temperate,Global North,-76.82,39.11949,2876.075,3526814
+Nairobi,KEN,-1.27881,36.8599,Temperate,3359622.671,Temperate,Africa,Temperate,Global South,36.8599,-1.27881,210.4,3359622.671
+Atlanta,USA,33.86297,-84.3159,Temperate,3343537,Temperate,Northern America,Temperate,Global North,-84.3159,33.86297,4569.427,3343537
+Bayrut,LBN,33.9065,35.5612,Temperate,3200106.973,Temperate,Asia,Temperate,Global South,35.5612,33.9065,189.7725,3200106.973
+Changsha,CHN,28.20278,112.9884,Temperate,3132475.699,Temperate,Asia,Temperate,Global South,112.9884,28.20278,776.9137,3132475.699
+Casablanca,MAR,33.59212,-7.55111,Temperate,3050029.358,Temperate,Africa,Temperate,Global South,-7.55111,33.59212,317.7373,3050029.358
+Ha Noi,VNM,21.02441,105.8455,Temperate,3013781.021,Temperate,Asia,Temperate,Global South,105.8455,21.02441,343.6667,3013781.021
+Lucknow,IND,26.84541,80.94617,Temperate,2890752.222,Temperate,Asia,Temperate,Global South,80.94617,26.84541,500.9804,2890752.222
+Melbourne,AUS,-37.8451,145.0372,Temperate,2855966.368,Temperate,Oceania,Temperate,Global North,145.0372,-37.8451,2078.243,2855966.368
+Bekasi-Bogor-Depok-Jakarta-Tangerang,IDN,-6.28775,106.8728,Tropical,23164715.98,Tropical,Asia,Tropical,Global South,106.8728,-6.28775,2474.055,23164715.98
+Mumbai,IND,19.11632,72.9238,Tropical,13480581.41,Tropical,Asia,Tropical,Global South,72.9238,19.11632,510.8706,13480581.41
+Bangkok-Samut Prakan,THA,13.76614,100.5392,Tropical,13190006.71,Tropical,Asia,Tropical,Global South,100.5392,13.76614,2127.031,13190006.71
+Manila,PHL,14.56537,121.0308,Tropical,12466823.17,Tropical,Asia,Tropical,Global South,121.0308,14.56537,912.1216,12466823.17
+Kolkata,IND,22.63242,88.36307,Tropical,12027777.38,Tropical,Asia,Tropical,Global South,88.36307,22.63242,558.7725,12027777.38
+Lagos,NGA,6.59386,3.285609,Tropical,9055727.501,Tropical,Africa,Tropical,Global South,3.285609,6.59386,784.8078,9055727.501
+Ho Chi Minh City,VNM,10.87595,106.711,Tropical,9024700.257,Tropical,Asia,Tropical,Global South,106.711,10.87595,879.251,9024700.257
+Bangalore,IND,12.95551,77.62517,Tropical,8669075.769,Tropical,Asia,Tropical,Global South,77.62517,12.95551,1022.275,8669075.769
+Rio de Janeiro,BRA,-22.8277,-43.4034,Tropical,7679178.181,Tropical,Latin America and the Caribbean,Tropical,Global South,-43.4034,-22.8277,952.251,7679178.181
+Chennai,IND,13.04227,80.18452,Tropical,7420158.88,Tropical,Asia,Tropical,Global South,80.18452,13.04227,715.349,7420158.88
+Hyderabad,IND,17.42992,78.46043,Tropical,6493165.792,Tropical,Asia,Tropical,Global South,78.46043,17.42992,733.2157,6493165.792
+Kuala Lumpur,MYS,3.058848,101.6276,Tropical,5397322.913,Tropical,Asia,Tropical,Global North,101.6276,3.058848,1773.008,5397322.913
+Kinshasa,COD,-4.38669,15.31429,Tropical,5225217.373,Tropical,Africa,Tropical,Global South,15.31429,-4.38669,322.8667,5225217.373
+Miami,USA,26.16663,-80.2476,Tropical,4742430.95,Tropical,Northern America,Tropical,Global North,-80.2476,26.16663,3721.176,4742430.95
+Accra,GHA,5.645864,-0.18736,Tropical,4118297.792,Tropical,Africa,Tropical,Global South,-0.18736,5.645864,1071.106,4118297.792
+Surabaya,IDN,-7.38138,112.681,Tropical,4113027.348,Tropical,Asia,Tropical,Global South,112.681,-7.38138,714.5412,4113027.348
+Belo Horizonte,BRA,-19.902,-44.0073,Tropical,3545615.348,Tropical,Latin America and the Caribbean,Tropical,Global South,-44.0073,-19.902,609.4078,3545615.348
+Abidjan,CIV,5.367911,-4.00767,Tropical,3320919.041,Tropical,Africa,Tropical,Global South,-4.00767,5.367911,289.4902,3320919.041
+Singapore,SGP,1.352897,103.825,Tropical,3018767.813,Tropical,Asia,Tropical,Global North,103.825,1.352897,404.9294,3018767.813
+Bamako,MLI,12.61802,-7.97663,Tropical,2883428.026,Tropical,Africa,Tropical,Global South,-7.97663,12.61802,217,2883428.026
+Yangon,MMR,16.85315,96.16451,Tropical,2764072.593,Tropical,Asia,Tropical,Global South,96.16451,16.85315,201.0078,2764072.593
+Fortaleza,BRA,-3.79451,-38.5532,Tropical,2626428.274,Tropical,Latin America and the Caribbean,Tropical,Global South,-38.5532,-3.79451,299.898,2626428.274
+Mbuji-Mayi,COD,-6.1207,23.59162,Tropical,2304438.147,Tropical,Africa,Tropical,Global South,23.59162,-6.1207,73.26667,2304438.147
+Medan,IDN,3.597225,98.67375,Tropical,2288460.824,Tropical,Asia,Tropical,Global South,98.67375,3.597225,453.4745,2288460.824
+Delhi,IND,28.59568,77.23483,Arid,22849957.02,Arid,Asia,Arid,Global South,77.23483,28.59568,2961.729,22849957.02
+Cairo,EGY,30.0286,31.25259,Arid,15269373.3,Arid,Africa,Arid,Global South,31.25259,30.0286,1670.408,15269373.3
+Luanda,AGO,-8.88276,13.31202,Arid,7224248.793,Arid,Africa,Arid,Global South,13.31202,-8.88276,554.5529,7224248.793
+Lahore,PAK,31.50447,74.28062,Arid,6883964.845,Arid,Asia,Arid,Global South,74.28062,31.50447,821.4784,6883964.845
+Lima,PER,-12.005,-77.0123,Arid,6780508.108,Arid,Latin America and the Caribbean,Arid,Global South,-77.0123,-12.005,660.1569,6780508.108
+Karaj-Tehran,IRN,35.71951,51.28153,Arid,6042180.346,Arid,Asia,Arid,Global South,51.28153,35.71951,997.8196,6042180.346
+Madrid,ESP,40.38797,-3.68179,Arid,5653334.014,Arid,Europe,Arid,Global North,-3.68179,40.38797,1864.439,5653334.014
+Ahmadabad,IND,23.02931,72.59157,Arid,5579798.849,Arid,Asia,Arid,Global South,72.59157,23.02931,290.7961,5579798.849
+Xian,CHN,34.3023,108.9094,Arid,5038647.027,Arid,Asia,Arid,Global South,108.9094,34.3023,1611.506,5038647.027
+Monterrey,MEX,25.72376,-100.302,Arid,4020260.672,Arid,Latin America and the Caribbean,Arid,Global South,-100.302,25.72376,914.2431,4020260.672
+Taiyuan,CHN,37.81252,112.6052,Arid,3675121.491,Arid,Asia,Arid,Global South,112.6052,37.81252,1113.58,3675121.491
+Phoenix-Mesa,USA,33.48581,-112.004,Arid,3641217.565,Arid,Northern America,Arid,Global North,-112.004,33.48581,3075.369,3641217.565
+Wulumqi,CHN,43.86105,87.53021,Arid,3014748.579,Arid,Asia,Arid,Global South,87.53021,43.86105,1033,3014748.579
+Baghdad,IRQ,33.3286,44.40175,Arid,2963164.832,Arid,Asia,Arid,Global South,44.40175,33.3286,607.451,2963164.832
+Ankara,TUR,39.9512,32.78739,Arid,2644325.789,Arid,Asia,Arid,Global North,32.78739,39.9512,452.3765,2644325.789
+Kano,NGA,11.99003,8.527157,Arid,2497641.464,Arid,Africa,Arid,Global South,8.527157,11.99003,191.8863,2497641.464
+Dakar,SEN,14.73934,-17.393,Arid,2384436.017,Arid,Africa,Arid,Global South,-17.393,14.73934,163.2314,2384436.017
+Denver-Aurora,USA,39.72656,-104.973,Arid,2218288.793,Arid,Northern America,Arid,Global North,-104.973,39.72656,1949.141,2218288.793
+Las Vegas,USA,36.13914,-115.163,Arid,2057179.774,Arid,Northern America,Arid,Global North,-115.163,36.13914,1129.604,2057179.774
+Lanzhou,CHN,36.08451,103.7627,Arid,2028591.862,Arid,Asia,Arid,Global South,103.7627,36.08451,339.1882,2028591.862
+Salt Lake City,USA,40.70622,-111.891,Arid,1951268.275,Arid,Northern America,Arid,Global North,-111.891,40.70622,1913.369,1951268.275
+Beijing,CHN,39.93569,116.3954,Continental,20054482.62,Continental,Asia,Continental,Global South,116.3954,39.93569,5605.373,20054482.62
+Goyang-Incheon-Seoul-Suweon-Yongin,KOR,37.47306,126.918,Continental,16920364.17,Continental,Asia,Continental,Global North,126.918,37.47306,2396.008,16920364.17
+New York-Newark,USA,40.63285,-74.0192,Continental,13425614.42,Continental,Northern America,Continental,Global North,-74.0192,40.63285,8143.016,13425614.42
+Chicago,USA,41.8721,-87.9732,Continental,6133241.042,Continental,Northern America,Continental,Global North,-87.9732,41.8721,7136.388,6133241.042
+Zhengzhou,CHN,34.68942,113.6806,Continental,5871437.795,Continental,Asia,Continental,Global South,113.6806,34.68942,2187.878,5871437.795
+Fushun-Shenyang,CHN,41.8007,123.4921,Continental,5818374.978,Continental,Asia,Continental,Global South,123.4921,41.8007,1620.016,5818374.978
+Toronto,CAN,43.66286,-79.5378,Continental,5177298,Continental,Northern America,Continental,Global North,-79.5378,43.66286,3644.482,5177298
+Haerbin,CHN,45.75033,126.6234,Continental,3901814.085,Continental,Asia,Continental,Global South,126.6234,45.75033,1035.631,3901814.085
+Jinan,CHN,36.66238,117.0816,Continental,3890067.825,Continental,Asia,Continental,Global South,117.0816,36.66238,1557.459,3890067.825
+Qingdao,CHN,36.26468,120.3983,Continental,3294785.117,Continental,Asia,Continental,Global South,120.3983,36.26468,959.8,3294785.117
+Detroit,USA,42.44529,-83.2441,Continental,3229546.907,Continental,Northern America,Continental,Global North,-83.2441,42.44529,4352.341,3229546.907
+Dalian,CHN,39.01233,121.6709,Continental,3039995.503,Continental,Asia,Continental,Global South,121.6709,39.01233,734.7294,3039995.503
+Montreal,CAN,45.56044,-73.6447,Continental,2887297,Continental,Northern America,Continental,Global North,-73.6447,45.56044,1551.184,2887297
+Berlin,DEU,52.50112,13.41518,Continental,2479017.295,Continental,Europe,Continental,Global North,13.41518,52.50112,1044.455,2479017.295
+Boston,USA,42.36155,-71.1005,Continental,2350746,Continental,Northern America,Continental,Global North,-71.1005,42.36155,1946.278,2350746
+Minneapolis-St. Paul,USA,44.96853,-93.2826,Continental,2332336.852,Continental,Northern America,Continental,Global North,-93.2826,44.96853,3581.984,2332336.852
+Kyiv,UKR,50.43851,30.50228,Continental,1853049.119,Continental,Europe,Continental,Global South,30.50228,50.43851,544.3882,1853049.119
