@@ -1,0 +1,1051 @@
+# ===============================
+# Exp Pack 4 (Step 1-3) on META NPZ
+#  Step1: correlation structure (+ plot)
+#  Step2: drop-group test (retrain once)
+#  Step3: naive vs conditional permutation importance (no retrain)
+# ===============================
+
+!pip -q install catboost
+
+import os, json, numpy as np
+import matplotlib.pyplot as plt
+
+from catboost import CatBoostRegressor, Pool
+from sklearn.model_selection import GroupShuffleSplit
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+
+# -------------------------------
+# 0) Config
+# -------------------------------
+NPZ_PATH = "/content/drive/MyDrive/anature_revised/ALLCITIES_train_xy_monthly_ERA5guidedREVISED_META_fine0.005_S2_100pct_TOP100.npz"
+
+OUT_DIR = "/content/exp_pack4_steps1_3_meta"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+RANDOM_SEED = 42
+
+DROP_FEATURES = {
+    "ERA5LMAIN.STL1",
+    "ERA5LMAIN.T2M",
+    "ERA5LMAIN.TD",
+}
+TARGET_LEAK_PREFIX = "LST."  
+
+
+META_KEYS = {
+    "CITY_ID": ["META.CITY_ID", "CITY_ID", "META.CITY"],
+    "X":       ["META.X", "META.LON", "LON", "LONGITUDE", "X"],
+    "Y":       ["META.Y", "META.LAT", "LAT", "LATITUDE", "Y"],
+}
+
+# Step3: permutation设置
+N_REPEATS = 3                 
+TEST_MAX_N = 400_000       
+RIDGE_ALPHA = 1.0          
+
+# CatBoost训练设置（快速且稳定）
+CB_PARAMS_GPU = dict(
+    iterations=2000,
+    depth=8,
+    learning_rate=0.07,
+    loss_function="RMSE",
+    eval_metric="RMSE",
+    random_seed=RANDOM_SEED,
+    od_type="Iter",
+    od_wait=150,
+    verbose=200,
+    task_type="GPU",
+    devices="0"
+)
+CB_PARAMS_CPU = dict(
+    iterations=1200,
+    depth=8,
+    learning_rate=0.07,
+    loss_function="RMSE",
+    eval_metric="RMSE",
+    random_seed=RANDOM_SEED,
+    od_type="Iter",
+    od_wait=150,
+    verbose=200
+)
+
+# -------------------------------
+# 1) Load NPZ
+# -------------------------------
+npz = np.load(NPZ_PATH, allow_pickle=True)
+X_raw = npz["X"].astype(np.float32)
+y_raw = npz["y"].astype(np.float32)
+channels_raw = npz["channels"].astype(object).tolist()
+
+print(f"Loaded: X={X_raw.shape}, y={y_raw.shape}, n_channels={len(channels_raw)}")
+print("First 20 channels:", channels_raw[:20])
+
+# y finite mask
+m_y = np.isfinite(y_raw)
+X_raw = X_raw[m_y]
+y = y_raw[m_y]
+print(f"After y finite mask: X={X_raw.shape}, y={y.shape}")
+
+# -------------------------------
+# 2) Identify META indices
+# -------------------------------
+def find_first(keys):
+    for k in keys:
+        if k in channels_raw:
+            return k, channels_raw.index(k)
+    return None, None
+
+city_key, city_idx = find_first(META_KEYS["CITY_ID"])
+x_key, x_idx       = find_first(META_KEYS["X"])
+y_key, y_idx       = find_first(META_KEYS["Y"])
+
+assert city_idx is not None, f"Cannot find city id channel. Tried: {META_KEYS['CITY_ID']}"
+
+city_id = X_raw[:, city_idx].astype(np.int32)
+
+print(f"META city key: {city_key} (idx={city_idx}) | unique cities={len(np.unique(city_id))}")
+print(f"META coord keys: X={x_key} (idx={x_idx}), Y={y_key} (idx={y_idx})")
+
+# -------------------------------
+# 3) Build feature matrix (remove META + drops)
+# -------------------------------
+drop_set = set(DROP_FEATURES)
+
+keep_cols = []
+kept_names = []
+dropped_names = []
+
+for i, ch in enumerate(channels_raw):
+    # drop META columns
+    if i in [city_idx, x_idx, y_idx] and i is not None:
+        dropped_names.append(ch); continue
+    # drop LST leakage features if exist
+    if ch.upper().startswith(TARGET_LEAK_PREFIX):
+        dropped_names.append(ch); continue
+    # drop specified list
+    if ch in drop_set:
+        dropped_names.append(ch); continue
+    keep_cols.append(i)
+    kept_names.append(ch)
+
+X = X_raw[:, keep_cols].astype(np.float32)
+channels = kept_names
+
+print(f"Final feature count: {len(channels)}")
+print("Final features (first 20):", channels[:20])
+print("Dropped (first 30):", dropped_names[:30])
+
+# helper: locate EVI/LAI indices in feature matrix
+def idx_of(name):
+    return channels.index(name) if name in channels else None
+
+evi_i = idx_of("EVI.EVI")
+lai_i = idx_of("LAI.LAI")
+assert evi_i is not None and lai_i is not None, "EVI.EVI / LAI.LAI not found in final features."
+
+# -------------------------------
+# 4) Create city-group holdout split (80/20 cities)
+# -------------------------------
+gss = GroupShuffleSplit(n_splits=1, test_size=0.20, random_state=RANDOM_SEED)
+train_idx, test_idx = next(gss.split(X, y, groups=city_id))
+
+X_tr, y_tr = X[train_idx], y[train_idx]
+X_te, y_te = X[test_idx],  y[test_idx]
+city_te = city_id[test_idx]
+
+print(f"[Split] train={X_tr.shape}, test={X_te.shape}, test_cities={len(np.unique(city_te))}")
+
+# subsample test for permutation speed
+rng = np.random.default_rng(RANDOM_SEED)
+if X_te.shape[0] > TEST_MAX_N:
+    take = rng.choice(X_te.shape[0], size=TEST_MAX_N, replace=False)
+    X_te_pi = X_te[take]
+    y_te_pi = y_te[take]
+else:
+    X_te_pi, y_te_pi = X_te, y_te
+
+print(f"[Permutation subset] test_n={X_te_pi.shape[0]} (cap={TEST_MAX_N})")
+
+# -------------------------------
+# Common eval function
+# -------------------------------
+def metrics(y_true, y_pred):
+    rmse = float(mean_squared_error(y_true, y_pred) ** 0.5)
+    mae  = float(mean_absolute_error(y_true, y_pred))
+    r2   = float(r2_score(y_true, y_pred))
+    return dict(rmse=rmse, mae=mae, r2=r2)
+
+# =========================================================
+# STEP 1) Correlation structure (global + by-city distribution)
+# =========================================================
+EVI = X[:, evi_i]
+LAI = X[:, lai_i]
+m = np.isfinite(EVI) & np.isfinite(LAI)
+EVI_m = EVI[m]
+LAI_m = LAI[m]
+city_m = city_id[m]
+
+# Pearson/Spearman (fast Spearman approx via ranks)
+def pearson(a,b):
+    a = a.astype(np.float64); b = b.astype(np.float64)
+    a -= a.mean(); b -= b.mean()
+    return float((a*b).sum() / np.sqrt((a*a).sum() * (b*b).sum() + 1e-12))
+
+def spearman(a,b):
+    # rank transform
+    ra = a.argsort().argsort().astype(np.float64)
+    rb = b.argsort().argsort().astype(np.float64)
+    return pearson(ra, rb)
+
+r_global = pearson(EVI_m, LAI_m)
+rho_global = spearman(EVI_m, LAI_m)
+
+# per-city correlations distribution (use cities with enough samples)
+per_city = {}
+for cid in np.unique(city_m):
+    idx = (city_m == cid)
+    if idx.sum() < 3000:  # 防止小样本城市噪声
+        continue
+    per_city[int(cid)] = pearson(EVI_m[idx], LAI_m[idx])
+
+per_city_vals = np.array(list(per_city.values()), dtype=float)
+step1 = {
+    "global": {"pearson_r": r_global, "spearman_rho": rho_global, "n": int(EVI_m.size)},
+    "per_city": {
+        "n_cities": int(per_city_vals.size),
+        "pearson_r_median": float(np.nanmedian(per_city_vals)) if per_city_vals.size else None,
+        "pearson_r_p25": float(np.nanpercentile(per_city_vals, 25)) if per_city_vals.size else None,
+        "pearson_r_p75": float(np.nanpercentile(per_city_vals, 75)) if per_city_vals.size else None,
+    }
+}
+
+# Plot killer: density scatter (hexbin)
+plt.figure(figsize=(7,6))
+hb = plt.hexbin(EVI_m, LAI_m, gridsize=70, bins="log")
+plt.colorbar(hb, label="Counts")
+plt.title("Correlation between EVI and LAI")
+plt.xlabel("EVI")
+plt.ylabel("LAI")
+plt.text(0.02, 0.95, f"Pearson r = {r_global:.2f}\nSpearman ρ = {rho_global:.2f}",
+         transform=plt.gca().transAxes,
+         ha="left", va="top",
+         bbox=dict(boxstyle="round", facecolor="white", alpha=0.9))
+fig1 = os.path.join(OUT_DIR, "step1_evi_lai_hexbin.png")
+plt.tight_layout()
+plt.savefig(fig1, dpi=160)
+plt.show()
+
+# Plot per-city correlation distribution
+plt.figure(figsize=(7,4))
+plt.hist(per_city_vals, bins=30, alpha=0.9)
+plt.title("Distribution of EVI–LAI Pearson r across cities")
+plt.xlabel("Pearson r (within-city)")
+plt.ylabel("City count")
+fig1b = os.path.join(OUT_DIR, "step1_citywise_corr_hist.png")
+plt.tight_layout()
+plt.savefig(fig1b, dpi=160)
+plt.show()
+
+with open(os.path.join(OUT_DIR, "step1_corr_structure.json"), "w") as f:
+    json.dump(step1, f, indent=2)
+print("[Step1] Saved:", fig1, fig1b, os.path.join(OUT_DIR, "step1_corr_structure.json"))
+
+# =========================================================
+# STEP 2) Drop-group retrain (baseline vs drop EVI+LAI)
+# =========================================================
+def fit_catboost(Xtr, ytr, Xva, yva, feat_names):
+    train_pool = Pool(Xtr, ytr, feature_names=feat_names)
+    val_pool   = Pool(Xva, yva, feature_names=feat_names)
+    # try GPU first
+    try:
+        m = CatBoostRegressor(**CB_PARAMS_GPU)
+        m.fit(train_pool, eval_set=val_pool, use_best_model=True)
+        used_gpu = True
+    except Exception as e:
+        m = CatBoostRegressor(**CB_PARAMS_CPU)
+        m.fit(train_pool, eval_set=val_pool, use_best_model=True)
+        used_gpu = False
+    return m, used_gpu
+
+# baseline
+model_base, used_gpu_base = fit_catboost(X_tr, y_tr, X_te, y_te, channels)
+pred_base = model_base.predict(X_te)
+m_base = metrics(y_te, pred_base)
+print(f"[Step2][Baseline] used_gpu={used_gpu_base} | {m_base}")
+
+# drop EVI+LAI
+drop_idx = [evi_i, lai_i]
+keep2 = [i for i in range(len(channels)) if i not in drop_idx]
+X_tr2 = X_tr[:, keep2]
+X_te2 = X_te[:, keep2]
+channels2 = [channels[i] for i in keep2]
+
+model_drop, used_gpu_drop = fit_catboost(X_tr2, y_tr, X_te2, y_te, channels2)
+pred_drop = model_drop.predict(X_te2)
+m_drop = metrics(y_te, pred_drop)
+print(f"[Step2][Drop-group] used_gpu={used_gpu_drop} | {m_drop}")
+
+step2 = {
+    "split": {"train_n": int(X_tr.shape[0]), "test_n": int(X_te.shape[0]), "test_cities": int(len(np.unique(city_te)))},
+    "baseline": {"metrics": m_base, "used_gpu": used_gpu_base, "n_features": int(len(channels))},
+    "drop_EVI_LAI": {"metrics": m_drop, "used_gpu": used_gpu_drop, "n_features": int(len(channels2))}
+}
+with open(os.path.join(OUT_DIR, "step2_drop_group_summary.json"), "w") as f:
+    json.dump(step2, f, indent=2)
+print("[Step2] Saved:", os.path.join(OUT_DIR, "step2_drop_group_summary.json"))
+
+# =========================================================
+# STEP 3) Naive vs Conditional permutation importance (EVI/LAI) on holdout
+# =========================================================
+# baseline rmse on permutation subset
+pred0 = model_base.predict(X_te_pi)
+rmse0 = mean_squared_error(y_te_pi, pred0) ** 0.5
+
+def permute_naive_delta_rmse(model, Xtest, ytest, j, repeats=3, seed=0):
+    rng = np.random.default_rng(seed)
+    deltas = []
+    for r in range(repeats):
+        Xp = Xtest.copy()
+        rng.shuffle(Xp[:, j])  # in-place permutation of column
+        p = model.predict(Xp)
+        rmse = mean_squared_error(ytest, p) ** 0.5
+        deltas.append(rmse - rmse0)
+    return float(np.mean(deltas)), float(np.std(deltas))
+
+def ridge_fit_residual(X_other, x_target, alpha=1.0):
+    """
+    Fit ridge: x ≈ X_other w + b, return residuals e = x - (Xw+b)
+    Closed-form, fast, stable.
+    """
+    Xo = X_other.astype(np.float64)
+    xt = x_target.astype(np.float64)
+
+    # add intercept
+    ones = np.ones((Xo.shape[0], 1), dtype=np.float64)
+    A = np.hstack([Xo, ones])  # (n, p+1)
+
+    # ridge on weights only, not intercept
+    p = A.shape[1]
+    I = np.eye(p, dtype=np.float64)
+    I[-1, -1] = 0.0  # no penalty for intercept
+
+    # solve (A^T A + alpha I) w = A^T x
+    ATA = A.T @ A
+    rhs = A.T @ xt
+    w = np.linalg.solve(ATA + alpha * I, rhs)
+    xhat = A @ w
+    resid = xt - xhat
+    return resid.astype(np.float32), xhat.astype(np.float32)
+
+def permute_conditional_delta_rmse(model, Xtest, ytest, j, alpha=1.0, repeats=3, seed=0):
+    """
+    Conditional (residual) permutation:
+      x_j = xhat(others) + resid
+      permute resid, keep xhat fixed => preserves correlation structure with others
+    """
+    rng = np.random.default_rng(seed)
+    # build others
+    others = [k for k in range(Xtest.shape[1]) if k != j]
+    Xo = Xtest[:, others]
+    xj = Xtest[:, j]
+
+    resid, xhat = ridge_fit_residual(Xo, xj, alpha=alpha)
+
+    deltas = []
+    for r in range(repeats):
+        Xp = Xtest.copy()
+        rp = resid.copy()
+        rng.shuffle(rp)
+        Xp[:, j] = xhat + rp
+        p = model.predict(Xp)
+        rmse = mean_squared_error(ytest, p) ** 0.5
+        deltas.append(rmse - rmse0)
+
+    return float(np.mean(deltas)), float(np.std(deltas))
+
+# run for EVI & LAI
+step3 = {"rmse0": float(rmse0), "n_test_perm": int(X_te_pi.shape[0]), "alpha": RIDGE_ALPHA, "repeats": N_REPEATS, "features": {}}
+
+for name, j in [("EVI.EVI", evi_i), ("LAI.LAI", lai_i)]:
+    m_na, s_na = permute_naive_delta_rmse(model_base, X_te_pi, y_te_pi, j, repeats=N_REPEATS, seed=RANDOM_SEED+11)
+    m_co, s_co = permute_conditional_delta_rmse(model_base, X_te_pi, y_te_pi, j, alpha=RIDGE_ALPHA, repeats=N_REPEATS, seed=RANDOM_SEED+23)
+    step3["features"][name] = {
+        "naive_mean": m_na, "naive_std": s_na,
+        "conditional_mean": m_co, "conditional_std": s_co
+    }
+    print(f"[Step3] {name}")
+    print(f"  naive:       {m_na:.4f} ± {s_na:.4f}")
+    print(f"  conditional: {m_co:.4f} ± {s_co:.4f}")
+
+# plot naive vs conditional
+labels = list(step3["features"].keys())
+naive = [step3["features"][k]["naive_mean"] for k in labels]
+cond  = [step3["features"][k]["conditional_mean"] for k in labels]
+
+x = np.arange(len(labels))
+w = 0.38
+plt.figure(figsize=(7,4.5))
+plt.bar(x - w/2, naive, width=w, label="Naive permutation")
+plt.bar(x + w/2, cond,  width=w, label="Conditional (residual) permutation")
+plt.xticks(x, labels)
+plt.ylabel("ΔRMSE on city-holdout test")
+plt.title("Permutation importance: naive vs conditional")
+plt.legend()
+fig3 = os.path.join(OUT_DIR, "step3_perm_importance_naive_vs_cond.png")
+plt.tight_layout()
+plt.savefig(fig3, dpi=160)
+plt.show()
+
+with open(os.path.join(OUT_DIR, "step3_perm_importance_EVI_LAI.json"), "w") as f:
+    json.dump(step3, f, indent=2)
+print("[Step3] Saved:", fig3, os.path.join(OUT_DIR, "step3_perm_importance_EVI_LAI.json"))
+
+print("\nDONE ✅  Exp Pack4 Step1-3 finished.")
+print("Outputs in:", OUT_DIR)
+
+# ============================================================
+# Nature-grade robustness: City-GroupKFold perturbation test
+# - Read existing NPZ
+# - Extract city_id from META.CITY_ID column in X
+# - Remove META.CITY_ID from features (avoid leakage)
+# - City-GroupKFold(K=5): train per fold, test on holdout cities
+# - Perturb selected features (e.g., EVI/LAI) with Gaussian noise
+# - Report baseline RMSE + ΔRMSE under perturbation (mean ± 95% CI)
+# - Save CSV/JSON + plot
+# ============================================================
+
+!pip -q install catboost
+
+import os, json, time
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from datetime import datetime
+from catboost import CatBoostRegressor, Pool
+from sklearn.model_selection import GroupKFold
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+
+# ---------------------------
+# 0) Config (edit here)
+# ---------------------------
+NPZ_PATH = "/content/drive/MyDrive/anature_revised/ALLCITIES_train_xy_monthly_S10_40pct_ntlmask_TOP100.npz"
+
+OUT_DIR = "/content/exp_pack_perturb_citycv"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+RANDOM_SEED = 42
+K = 5
+
+# Runtime control (speed)
+N_PER_FOLD = 200000          # sample size from each fold's test set (reduce if slow)
+R = 5                        # repeats per sigma (increase to 10/20 for stronger stats)
+SIGMA_LIST = [0.00, 0.05, 0.10, 0.20]   # noise strength relative to feature std
+
+# Which features to perturb
+PERTURB_FEATURES = ["EVI.EVI", "LAI.LAI"]
+
+# Optional: drop some features from training (keep consistent with your manuscript)
+DROP_FEATURES = {"ERA5LMAIN.STL1", "ERA5LMAIN.T2M", "ERA5LMAIN.TD"}  # add/remove as you like
+
+# CatBoost parameters (fast but solid; increase iterations if you want)
+CB_PARAMS_GPU = dict(
+    iterations=3000,
+    depth=8,
+    learning_rate=0.05,
+    l2_leaf_reg=3.0,
+    loss_function="RMSE",
+    eval_metric="RMSE",
+    random_seed=RANDOM_SEED,
+    task_type="GPU",
+    devices="0",
+    od_type="Iter",
+    od_wait=150,
+    verbose=False,
+)
+
+CB_PARAMS_CPU = dict(
+    iterations=2000,
+    depth=8,
+    learning_rate=0.05,
+    l2_leaf_reg=3.0,
+    loss_function="RMSE",
+    eval_metric="RMSE",
+    random_seed=RANDOM_SEED,
+    od_type="Iter",
+    od_wait=150,
+    verbose=False,
+)
+
+# ---------------------------
+# 1) Load NPZ
+# ---------------------------
+npz = np.load(NPZ_PATH, allow_pickle=True)
+X = npz["X"].astype(np.float32)
+y = npz["y"].astype(np.float32)
+channels = npz["channels"].astype(object).tolist()
+
+print(f"Loaded: X={X.shape}, y={y.shape}, n_channels={len(channels)}")
+print("First 20 channels:", channels[:20])
+
+# Basic finite mask on y
+m = np.isfinite(y)
+X = X[m]
+y = y[m]
+print(f"After y finite mask: X={X.shape}, y={y.shape}")
+
+# ---------------------------
+# 2) Extract city_id from X and remove it from features
+# ---------------------------
+if "META.CITY_ID" not in channels:
+    raise ValueError("META.CITY_ID not found in channels. Your NPZ must include this column to do city-group CV.")
+
+city_col = channels.index("META.CITY_ID")
+city_id = X[:, city_col].astype(np.int32)
+
+# Remove city id from X/features (avoid leakage)
+X = np.delete(X, city_col, axis=1)
+channels_wo_city = [c for c in channels if c != "META.CITY_ID"]
+
+print("City groups:", len(np.unique(city_id)))
+print("Feature count after removing META.CITY_ID:", X.shape[1])
+
+# ---------------------------
+# 3) Apply optional feature drops (keep consistent with your baseline)
+# ---------------------------
+keep_idx = []
+dropped = []
+for i, ch in enumerate(channels_wo_city):
+    if ch in DROP_FEATURES:
+        dropped.append(ch)
+    elif ch.upper().startswith("LST."):
+        # extra safety: do not allow any LST leakage if accidentally present
+        dropped.append(ch)
+    else:
+        keep_idx.append(i)
+
+X = X[:, keep_idx]
+channels_final = [channels_wo_city[i] for i in keep_idx]
+
+print(f"Kept features={len(channels_final)} | Dropped={len(dropped)}")
+print("Dropped (first 20):", dropped[:20])
+print("Final features (first 20):", channels_final[:20])
+
+# Indices of perturb features
+perturb_cols = []
+missing_perturb = []
+for f in PERTURB_FEATURES:
+    if f in channels_final:
+        perturb_cols.append(channels_final.index(f))
+    else:
+        missing_perturb.append(f)
+if missing_perturb:
+    print("⚠️ These perturb features are missing in final features:", missing_perturb)
+if not perturb_cols:
+    raise ValueError("None of PERTURB_FEATURES exist in the final feature list.")
+
+# Precompute feature std (for scaling sigma)
+feat_std = np.nanstd(X, axis=0).astype(np.float32)
+feat_std[~np.isfinite(feat_std)] = 0.0
+feat_std[feat_std == 0] = 1.0  # avoid sigma=0 issues
+
+# ---------------------------
+# 4) Helpers
+# ---------------------------
+def evaluate(y_true, y_pred):
+    rmse = float(np.sqrt(mean_squared_error(y_true, y_pred)))
+    mae  = float(mean_absolute_error(y_true, y_pred))
+    r2   = float(r2_score(y_true, y_pred))
+    return rmse, mae, r2
+
+def train_catboost(Xtr, ytr, Xva, yva, feature_names):
+    train_pool = Pool(Xtr, ytr, feature_names=feature_names)
+    val_pool   = Pool(Xva, yva, feature_names=feature_names)
+    try:
+        model = CatBoostRegressor(**CB_PARAMS_GPU)
+        model.fit(train_pool, eval_set=val_pool, use_best_model=True)
+        return model, True
+    except Exception as e:
+        model = CatBoostRegressor(**CB_PARAMS_CPU)
+        model.fit(train_pool, eval_set=val_pool, use_best_model=True)
+        return model, False
+
+def sample_indices(rng, n, k):
+    if k <= 0 or k >= n:
+        return np.arange(n, dtype=np.int64)
+    return rng.choice(n, size=k, replace=False)
+
+def perturb_X_gaussian(Xbase, cols, sigma_rel, rng):
+    """
+    Xbase: (n,d)
+    cols: list of feature indices to perturb
+    sigma_rel: scalar, noise = sigma_rel * std(feature)
+    returns Xpert (copy)
+    """
+    if sigma_rel <= 0:
+        return Xbase  # no copy for speed
+    Xp = Xbase.copy()
+    for c in cols:
+        s = sigma_rel * feat_std[c]
+        noise = rng.normal(0.0, s, size=Xp.shape[0]).astype(np.float32)
+        Xp[:, c] = (Xp[:, c] + noise).astype(np.float32)
+    return Xp
+
+def mean_ci95(arr):
+    arr = np.asarray(arr, dtype=float)
+    m = float(np.mean(arr))
+    if arr.size <= 1:
+        return m, 0.0
+    se = float(np.std(arr, ddof=1) / np.sqrt(arr.size))
+    return m, 1.96 * se
+
+# ---------------------------
+# 5) City-GroupKFold perturbation experiment
+# ---------------------------
+gkf = GroupKFold(n_splits=K)
+rng = np.random.default_rng(RANDOM_SEED)
+
+rows = []
+fold_models = []
+
+stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+run_tag = f"perturb_citycv_{stamp}"
+t0 = time.time()
+
+for fold, (tr_idx, te_idx) in enumerate(gkf.split(X, y, groups=city_id), 1):
+    # Train/val split within training cities (simple holdout for early stopping)
+    # (fast & OK; if you want, you can do another Group split inside training)
+    Xtr_full, ytr_full = X[tr_idx], y[tr_idx]
+    Xte_full, yte_full = X[te_idx], y[te_idx]
+
+    # Make a small validation set from training for early stopping
+    # (random sample inside training; doesn't leak holdout cities)
+    ntr = Xtr_full.shape[0]
+    val_n = min(200000, max(50000, int(0.1 * ntr)))  # adaptive
+    val_idx_local = sample_indices(rng, ntr, val_n)
+    tr_mask = np.ones(ntr, dtype=bool)
+    tr_mask[val_idx_local] = False
+
+    Xtr, ytr = Xtr_full[tr_mask], ytr_full[tr_mask]
+    Xva, yva = Xtr_full[val_idx_local], ytr_full[val_idx_local]
+
+    model, used_gpu = train_catboost(Xtr, ytr, Xva, yva, channels_final)
+
+    # Sample test points for speed
+    nte = Xte_full.shape[0]
+    take = min(N_PER_FOLD, nte)
+    take_idx = sample_indices(rng, nte, take)
+    Xte = Xte_full[take_idx]
+    yte = yte_full[take_idx]
+
+    # Baseline
+    yhat0 = model.predict(Xte)
+    rmse0, mae0, r20 = evaluate(yte, yhat0)
+
+    print(f"[Fold {fold}/{K}] baseline RMSE={rmse0:.3f} MAE={mae0:.3f} R2={r20:.3f} | used_gpu={used_gpu} | test_n={take}")
+
+    # Perturb for each sigma, repeated R times
+    for sigma in SIGMA_LIST:
+        deltas = []
+        rmses  = []
+        for rep in range(R):
+            rrng = np.random.default_rng(RANDOM_SEED + fold*1000 + rep*10 + int(sigma*100))
+            Xp = perturb_X_gaussian(Xte, perturb_cols, sigma_rel=sigma, rng=rrng)
+            yhat = model.predict(Xp)
+            rmse, _, _ = evaluate(yte, yhat)
+            rmses.append(rmse)
+            deltas.append(rmse - rmse0)
+
+        d_mean, d_ci = mean_ci95(deltas)
+        r_mean, r_ci = mean_ci95(rmses)
+
+        rows.append({
+            "fold": fold,
+            "sigma_rel": float(sigma),
+            "test_n": int(take),
+            "baseline_rmse": rmse0,
+            "pert_rmse_mean": r_mean,
+            "pert_rmse_ci95": r_ci,
+            "delta_rmse_mean": d_mean,
+            "delta_rmse_ci95": d_ci,
+            "perturb_features": ",".join(PERTURB_FEATURES),
+            "used_gpu": bool(used_gpu)
+        })
+
+df = pd.DataFrame(rows)
+csv_path = os.path.join(OUT_DIR, f"{run_tag}.csv")
+json_path = os.path.join(OUT_DIR, f"{run_tag}.json")
+
+df.to_csv(csv_path, index=False)
+
+with open(json_path, "w") as f:
+    json.dump({
+        "npz": NPZ_PATH,
+        "K": K,
+        "N_PER_FOLD": N_PER_FOLD,
+        "R": R,
+        "SIGMA_LIST": SIGMA_LIST,
+        "PERTURB_FEATURES": PERTURB_FEATURES,
+        "DROP_FEATURES": sorted(list(DROP_FEATURES)),
+        "n_samples": int(X.shape[0]),
+        "n_features": int(X.shape[1]),
+        "n_cities": int(len(np.unique(city_id))),
+        "results": df.to_dict(orient="records"),
+        "elapsed_sec": float(time.time() - t0),
+    }, f, indent=2)
+
+print("\nSaved:")
+print("-", csv_path)
+print("-", json_path)
+print("Elapsed (sec):", round(time.time() - t0, 1))
+
+# ---------------------------
+# 6) Plot: ΔRMSE vs sigma (mean across folds)
+# ---------------------------
+plt.figure(figsize=(7,4.5))
+g = df.groupby("sigma_rel")["delta_rmse_mean"].agg(["mean", "std"]).reset_index()
+plt.errorbar(g["sigma_rel"], g["mean"], yerr=1.96*g["std"]/np.sqrt(K), fmt="-o")
+plt.axhline(0, linestyle=":", linewidth=1)
+plt.xlabel("Noise level (sigma as fraction of feature std)")
+plt.ylabel("ΔRMSE on holdout cities")
+plt.title(f"Perturbation robustness (City-GroupKFold, K={K})\nFeatures: {', '.join(PERTURB_FEATURES)}")
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+# ============================================================
+# CV-SHAP (5-fold) — City-GroupKFold (Hardcore & reviewer-proof)
+# - Train CatBoost per fold using city-group split
+# - Compute SHAP on each fold test subset (fast subsample)
+# - Aggregate stability across folds (freq, rank corr, CI)
+# ============================================================
+
+!pip -q install catboost
+
+import os, json, math
+import numpy as np
+import pandas as pd
+from datetime import datetime
+from itertools import combinations
+
+from catboost import CatBoostRegressor, Pool
+from sklearn.model_selection import GroupKFold
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+
+# --------------------------
+# 0) CONFIG
+# --------------------------
+NPZ_PATH = "/content/drive/MyDrive/anature_revised/ALLCITIES_train_xy_monthly_ERA5guidedREVISED_fine0.005_S2_100pct_TOP100.npz"
+OUT_DIR  = "/content/cv_shap_results"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+RANDOM_SEED = 42
+N_SPLITS = 5
+
+# Drop features (like your baseline)
+DROP_LIST = {"ERA5LMAIN.STL1", "ERA5LMAIN.T2M", "ERA5LMAIN.TD"}  # adjust if needed
+CITY_COL  = "META.CITY_ID"
+
+# CatBoost training params (GPU + early stop)
+CB_PARAMS_GPU = dict(
+    iterations=8000,
+    depth=8,
+    learning_rate=0.08,
+    l2_leaf_reg=3.0,
+    loss_function="RMSE",
+    eval_metric="RMSE",
+    random_seed=RANDOM_SEED,
+    task_type="GPU",
+    devices="0",
+    od_type="Iter",
+    od_wait=200,
+    verbose=200,
+)
+
+CB_PARAMS_CPU_FALLBACK = dict(
+    iterations=3000,
+    depth=8,
+    learning_rate=0.05,
+    l2_leaf_reg=3.0,
+    loss_function="RMSE",
+    eval_metric="RMSE",
+    random_seed=RANDOM_SEED,
+    od_type="Iter",
+    od_wait=200,
+    verbose=200,
+)
+
+# SHAP computation budget per fold (controls runtime)
+# 50k–150k is usually enough for stable mean(|SHAP|)
+SHAP_MAX_SAMPLES_PER_FOLD = 120_000
+SHAP_TOPK = 20
+
+# --------------------------
+# 1) LOAD DATA
+# --------------------------
+npz = np.load(NPZ_PATH, allow_pickle=True)
+X_raw = npz["X"].astype(np.float32)
+y_raw = npz["y"].astype(np.float32)
+channels_raw = npz["channels"].astype(object).tolist()
+
+print(f"Loaded: X={X_raw.shape}, y={y_raw.shape}, n_channels={len(channels_raw)}")
+
+# y finite mask
+mask = np.isfinite(y_raw)
+X_raw = X_raw[mask]
+y = y_raw[mask]
+
+# identify city column
+assert CITY_COL in channels_raw, f"Missing {CITY_COL} in channels"
+city_idx = channels_raw.index(CITY_COL)
+groups_city = X_raw[:, city_idx].astype(np.int32)
+
+# Build keep features (exclude CITY_ID from features; you already drop it in modeling)
+keep_idx = []
+dropped = []
+for i, ch in enumerate(channels_raw):
+    if ch == CITY_COL:
+        dropped.append(ch); continue
+    if ch.upper().startswith("LST."):  # safety
+        dropped.append(ch); continue
+    if ch in DROP_LIST:
+        dropped.append(ch); continue
+    keep_idx.append(i)
+
+X = X_raw[:, keep_idx]
+features = [channels_raw[i] for i in keep_idx]
+
+print(f"After mask: X={X.shape}, y={y.shape}")
+print(f"Features kept: {len(features)}")
+print(f"Features dropped: {len(dropped)} (first 10): {dropped[:10]}")
+
+# --------------------------
+# 2) HELPERS
+# --------------------------
+def eval_metrics(y_true, y_pred):
+    rmse = float(mean_squared_error(y_true, y_pred) ** 0.5)
+    mae  = float(mean_absolute_error(y_true, y_pred))
+    r2   = float(r2_score(y_true, y_pred))
+    return {"rmse": rmse, "mae": mae, "r2": r2}
+
+def try_train_catboost(X_tr, y_tr, X_te, y_te, feature_names):
+    train_pool = Pool(X_tr, y_tr, feature_names=feature_names)
+    test_pool  = Pool(X_te, y_te, feature_names=feature_names)
+    # try GPU first
+    try:
+        model = CatBoostRegressor(**CB_PARAMS_GPU)
+        model.fit(train_pool, eval_set=test_pool, use_best_model=True)
+        used_gpu = True
+    except Exception as e:
+        print("[WARN] GPU training failed -> CPU fallback:", repr(e))
+        model = CatBoostRegressor(**CB_PARAMS_CPU_FALLBACK)
+        model.fit(train_pool, eval_set=test_pool, use_best_model=True)
+        used_gpu = False
+    return model, used_gpu
+
+def fast_shap_mean_abs(model, X_te, feature_names, max_samples=120_000, seed=42):
+    """
+    Compute mean(|SHAP|) on a subsample of test set.
+    CatBoost returns matrix (n, n_features+1) with last column = expected_value.
+    """
+    n = X_te.shape[0]
+    if n == 0:
+        return np.zeros((len(feature_names),), dtype=np.float64), 0
+
+    rng = np.random.default_rng(seed)
+    if n > max_samples:
+        idx = rng.choice(n, size=max_samples, replace=False)
+        Xs = X_te[idx]
+    else:
+        Xs = X_te
+
+    pool = Pool(Xs, feature_names=feature_names)
+    shap = model.get_feature_importance(pool, type="ShapValues")  # (m, p+1)
+    shap = np.asarray(shap)
+    shap_feat = shap[:, :-1]  # drop expected value
+    mean_abs = np.mean(np.abs(shap_feat), axis=0).astype(np.float64)
+    return mean_abs, Xs.shape[0]
+
+def rankdata_desc(values):
+    # rank 1 = largest
+    order = np.argsort(-values)
+    ranks = np.empty_like(order)
+    ranks[order] = np.arange(1, len(values)+1)
+    return ranks
+
+def spearman_rho(a, b):
+    # Spearman via rank correlation (no scipy dependency)
+    ra = rankdata_desc(a).astype(np.float64)
+    rb = rankdata_desc(b).astype(np.float64)
+    ra -= ra.mean(); rb -= rb.mean()
+    denom = np.sqrt(np.sum(ra**2) * np.sum(rb**2))
+    if denom == 0:
+        return np.nan
+    return float(np.sum(ra*rb) / denom)
+
+# --------------------------
+# 3) CV LOOP (City-GroupKFold)
+# --------------------------
+gkf = GroupKFold(n_splits=N_SPLITS)
+
+fold_metrics = []
+fold_shap = []         # list of mean_abs shap arrays
+fold_topk = []         # list of topk feature names per fold
+fold_used_gpu = []
+
+stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+run_dir = os.path.join(OUT_DIR, f"cv_shap_city_{stamp}")
+os.makedirs(run_dir, exist_ok=True)
+
+unique_cities = np.unique(groups_city)
+print(f"Unique city groups: {len(unique_cities)} | CV folds: {N_SPLITS}")
+print("Run dir:", run_dir)
+
+for fold, (tr_idx, te_idx) in enumerate(gkf.split(X, y, groups=groups_city), start=1):
+    X_tr, y_tr = X[tr_idx], y[tr_idx]
+    X_te, y_te = X[te_idx], y[te_idx]
+
+    train_groups = np.unique(groups_city[tr_idx]).size
+    test_groups  = np.unique(groups_city[te_idx]).size
+
+    print(f"\n[Fold {fold}/{N_SPLITS}] train={X_tr.shape} test={X_te.shape} (groups train/test={train_groups}/{test_groups})")
+
+    model, used_gpu = try_train_catboost(X_tr, y_tr, X_te, y_te, features)
+    fold_used_gpu.append(bool(used_gpu))
+
+    pred = model.predict(X_te)
+    met = eval_metrics(y_te, pred)
+    met.update({"fold": fold, "train_groups": int(train_groups), "test_groups": int(test_groups),
+                "n_train": int(X_tr.shape[0]), "n_test": int(X_te.shape[0]), "used_gpu": bool(used_gpu)})
+    fold_metrics.append(met)
+    print(f"[Fold {fold}] RMSE={met['rmse']:.3f}  MAE={met['mae']:.3f}  R2={met['r2']:.3f} | GPU={used_gpu}")
+
+    # SHAP on test subset
+    mean_abs, n_used = fast_shap_mean_abs(
+        model, X_te, features,
+        max_samples=SHAP_MAX_SAMPLES_PER_FOLD,
+        seed=RANDOM_SEED + fold
+    )
+    fold_shap.append(mean_abs)
+
+    top_idx = np.argsort(-mean_abs)[:SHAP_TOPK]
+    top_names = [features[i] for i in top_idx]
+    fold_topk.append(top_names)
+
+    print(f"[Fold {fold}] SHAP computed on n={n_used:,} test samples. Top1={top_names[0]}")
+
+    # save per-fold artifacts
+    np.save(os.path.join(run_dir, f"fold{fold:02d}_shap_meanabs.npy"), mean_abs)
+    with open(os.path.join(run_dir, f"fold{fold:02d}_top{SHAP_TOPK}.json"), "w") as f:
+        json.dump({"fold": fold, "top_features": top_names}, f, indent=2)
+
+# --------------------------
+# 4) AGGREGATE STABILITY
+# --------------------------
+fold_metrics_df = pd.DataFrame(fold_metrics)
+fold_metrics_df.to_csv(os.path.join(run_dir, "cv_metrics.csv"), index=False)
+
+S = np.vstack(fold_shap)  # (Kfold, p)
+mean_imp = S.mean(axis=0)
+std_imp  = S.std(axis=0, ddof=1) if N_SPLITS > 1 else np.zeros_like(mean_imp)
+
+# 95% CI across folds (t approx ~ use 1.96 for simplicity; folds=5 small but ok for rebuttal)
+ci95 = 1.96 * std_imp / max(1.0, math.sqrt(N_SPLITS))
+
+# TopK frequency
+topk_freq = {f: 0 for f in features}
+for top_list in fold_topk:
+    for f in top_list:
+        topk_freq[f] += 1
+topk_freq = {k: v/N_SPLITS for k, v in topk_freq.items()}  # frequency in [0,1]
+
+# Rank correlation across fold pairs
+pair_rhos = []
+for i, j in combinations(range(N_SPLITS), 2):
+    rho = spearman_rho(S[i], S[j])
+    pair_rhos.append(rho)
+rho_mean = float(np.nanmean(pair_rhos))
+rho_std  = float(np.nanstd(pair_rhos, ddof=1)) if len(pair_rhos) > 1 else 0.0
+
+# Build summary table
+summary_df = pd.DataFrame({
+    "feature": features,
+    "shap_mean_abs_mean": mean_imp,
+    "shap_mean_abs_std": std_imp,
+    "shap_mean_abs_ci95": ci95,
+    "topk_freq": [topk_freq[f] for f in features],
+})
+summary_df = summary_df.sort_values("shap_mean_abs_mean", ascending=False)
+summary_df.to_csv(os.path.join(run_dir, "cv_shap_summary.csv"), index=False)
+
+# Save JSON summary for rebuttal
+summary = {
+    "cv_type": "City-GroupKFold",
+    "n_splits": N_SPLITS,
+    "shap_max_samples_per_fold": int(SHAP_MAX_SAMPLES_PER_FOLD),
+    "topk": int(SHAP_TOPK),
+    "metrics_mean": {
+        "rmse": float(fold_metrics_df["rmse"].mean()),
+        "mae":  float(fold_metrics_df["mae"].mean()),
+        "r2":   float(fold_metrics_df["r2"].mean()),
+    },
+    "metrics_std": {
+        "rmse": float(fold_metrics_df["rmse"].std(ddof=1)),
+        "mae":  float(fold_metrics_df["mae"].std(ddof=1)),
+        "r2":   float(fold_metrics_df["r2"].std(ddof=1)),
+    },
+    "rank_stability_spearman": {
+        "pairwise_rho_mean": rho_mean,
+        "pairwise_rho_std": rho_std,
+        "pairwise_rhos": [float(x) for x in pair_rhos],
+    },
+    "files": {
+        "run_dir": run_dir,
+        "cv_metrics_csv": os.path.join(run_dir, "cv_metrics.csv"),
+        "cv_shap_summary_csv": os.path.join(run_dir, "cv_shap_summary.csv"),
+    }
+}
+with open(os.path.join(run_dir, "cv_shap_summary.json"), "w") as f:
+    json.dump(summary, f, indent=2)
+
+print("\n✅ CV-SHAP finished.")
+print("Saved:")
+print(" -", os.path.join(run_dir, "cv_metrics.csv"))
+print(" -", os.path.join(run_dir, "cv_shap_summary.csv"))
+print(" -", os.path.join(run_dir, "cv_shap_summary.json"))
+
+# --------------------------
+# 5) OPTIONAL: A single "killer" plot (Top 15 mean±CI + freq)
+# (still fast; helps rebuttal)
+# --------------------------
+import matplotlib.pyplot as plt
+
+TOPPLOT = 15
+plot_df = summary_df.head(TOPPLOT).copy()
+ypos = np.arange(plot_df.shape[0])
+
+plt.figure(figsize=(9, 6))
+plt.barh(ypos, plot_df["shap_mean_abs_mean"].values)
+plt.gca().invert_yaxis()
+plt.yticks(ypos, plot_df["feature"].values)
+
+# CI whiskers
+x = plot_df["shap_mean_abs_mean"].values
+err = plot_df["shap_mean_abs_ci95"].values
+plt.errorbar(x, ypos, xerr=err, fmt="none")
+
+# annotate freq
+for i in range(plot_df.shape[0]):
+    plt.text(x[i] + (err[i] if np.isfinite(err[i]) else 0.0),
+             ypos[i],
+             f"  freq={plot_df['topk_freq'].values[i]:.2f}",
+             va="center")
+
+plt.xlabel("mean(|SHAP|) across folds (test subsets)")
+plt.title(f"CV-SHAP stability (City-GroupKFold, K={N_SPLITS})")
+plt.tight_layout()
+
+out_fig = os.path.join(run_dir, "cv_shap_top15_stability.png")
+plt.savefig(out_fig, dpi=200, bbox_inches="tight")
+plt.show()
+
+print("🖼️ Saved plot:", out_fig)
