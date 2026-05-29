@@ -14,7 +14,8 @@ The central research questions are:
 
 The analysis covers approximately 100 globally distributed cities over 2013-2025. It uses MODIS, VIIRS, ERA5-Land, DEM/SRTM, MODIS land cover, and Koppen-Geiger climate-zone information. A CatBoost model is trained to predict daytime land surface temperature (LST), and interpretable perturbation experiments are then used to quantify the nonlinear response of LST to vegetation greenness and canopy structure, represented mainly by EVI and LAI.
 
-The core data is located in the link; you can download it directly and place it in the specified folder for immediate use. (Includes...ALLCITIES_train_xy_monthly_S10_40pct_ntlmask_TOP100, Köppen_data, selected_cities_fullinfo, typical_timeseries_fast)
+The core data is located in the link; you can download it directly and place it in the specified folder for immediate use (https://figshare.com/account/items/32494290/edit). (Includes...ALLCITIES_train_xy_monthly_S10_40pct_ntlmask_TOP100, Köppen_data, selected_cities_fullinfo, typical_timeseries_fast)
+
 ## Repository Contents
 
 | File | Environment | Purpose | Typical outputs |
