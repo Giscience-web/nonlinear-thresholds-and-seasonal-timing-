@@ -6,8 +6,8 @@ import rasterio
 from tqdm import tqdm
 import pandas as pd
 
-ROOT = "/content/drive/MyDrive/anature_revised/data"
-
+ROOT = "/content/drive/MyDrive/anature_revised/data" 
+# #This is the raw data downloaded from GEE. Since the data volume is very large, you can ask the corresponding author for the download link of the raw data, and we will provide you with the link license.
 
 CORE_TOP_P = 90
 
