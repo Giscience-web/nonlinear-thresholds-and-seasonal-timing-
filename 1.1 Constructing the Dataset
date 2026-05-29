@@ -1,0 +1,620 @@
+# -*- coding: utf-8 -*-
+# ============================================================
+# ERA5-guided stratified sampling dataset builder (LATEST-1Y)
+# - ONLY keep the latest year (max YYYY in months)
+# - Output NPZ format unchanged: X, y, channels, used_cities, note
+#
+
+# ============================================================
+
+!pip -q install rasterio tqdm
+
+import os, re, math, gc
+from collections import defaultdict
+import numpy as np
+import pandas as pd
+import rasterio
+from rasterio.enums import Resampling
+from tqdm import tqdm
+
+# ============================================================
+# 0) Config
+# ============================================================
+ROOT = "/content/drive/MyDrive/anature_revised/data"
+
+FINE_DEG = 0.005
+ERA_DEG  = 0.10
+
+# You can still use this knob for speed
+SPATIAL_SUBSAMPLE = 1   # 4/6/8; larger -> much faster (coarser)
+
+SAMPLE_FRAC = 1.0
+RANDOM_SEED     = 42
+CITY_LIMIT      = 100
+MIN_CITY_PIXELS = 20
+CITY_WHITELIST  = []
+
+# ---- Keep ONLY latest year months ----
+USE_LATEST_YEAR_ONLY = False
+
+# ---- Urban core via NTL (optional) ----
+USE_NTL_CORE = False
+NTL_PCT_BRIGHTEST = 99
+NTL_KEYS = {"NTL","VIIRS","NIGHT","NIGHTLIGHT"}
+NTL_MIN_ABS = 0.0
+
+# Target selection (LST)
+TARGET_PREFS = ("LST.LSTD", "LST.LST_DAY", "LST_DAY")
+EXCLUDE_LST_FEATURES = True
+
+# ---- Water handling ----
+WATER_CODE = 17
+WATER_FRAC_THR = 0.3
+REQUIRE_LAND_PIXEL = True
+
+# ---- Validity mask requirements ----
+REQ_SUBSTRINGS = ["EVI", "LAI", "VPD", "SSRD", "T2M", "TD", "TP"]
+
+# ---- Optional channel prefilter (recommended for speed) ----
+USE_CHANNEL_PREFILTER = True
+KEEP_CHANNEL_SUBSTRINGS = [
+    "EVI","LAI",
+    "T2M","VPD","SSRD","TP","TD",
+    "LC",
+    "NTL","VIIRS","NIGHT","NIGHTLIGHT",
+    # add others you need:
+    "DEM","SLOPE","NDBI","IMPERV","BUILT","URBAN","WATERDIST","DISTWATER",
+]
+ALWAYS_KEEP_TARGET_HINTS = ["LST"]
+
+PRUNE_TRIPLES_EARLY = True
+VERBOSE = True
+
+OUT_NPZ = (
+    f"/content/ALLCITIES_train_xy_LATEST1Y_"
+    f"fine{FINE_DEG}_S{SPATIAL_SUBSAMPLE}_{int(SAMPLE_FRAC*100)}pct_TOP{CITY_LIMIT}.npz"
+)
+OUT_CITY_STATS = f"/content/city_sampling_stats_LATEST1Y_TOP{CITY_LIMIT}.csv"
+
+os.environ["GDAL_NUM_THREADS"] = "ALL_CPUS"
+os.environ["GDAL_CACHEMAX"]   = "2048"
+ALLOW_EXT = {".tif", ".tiff"}
+
+# ============================================================
+# 1) Regex helpers
+# ============================================================
+DATE8  = re.compile(r"(?:^|_)(\d{8})(?:_|$)")
+SUBVAR = re.compile(r"^[A-Za-z0-9]+")
+
+# ============================================================
+# 2) Utils
+# ============================================================
+def list_cities(root):
+    return sorted([d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))])
+
+def apply_city_whitelist(all_cities, whitelist):
+    if not whitelist:
+        return all_cities
+    picked = [c for c in whitelist if c in all_cities]
+    rest   = [c for c in all_cities if c not in picked]
+    return picked + rest
+
+def city_files(root, city):
+    cdir = os.path.join(root, city)
+    files = [
+        f for f in sorted(os.listdir(cdir))
+        if os.path.isfile(os.path.join(cdir, f)) and os.path.splitext(f)[1].lower() in ALLOW_EXT
+    ]
+    return cdir, files
+
+def infer_var_from_filename(filename, city):
+    base = re.sub(rf"^{re.escape(city)}_", "", filename, flags=re.IGNORECASE)
+    return base.split("_")[0].upper()
+
+def yyyymm_from_yyyymmdd(d8):
+    return d8[:6] if (d8 and len(d8) == 8) else None
+
+def parse_band_desc(desc, major_var):
+    subvar, mkey = None, "STATIC"
+    if desc:
+        m_date = DATE8.search(desc)
+        if m_date:
+            mm = yyyymm_from_yyyymmdd(m_date.group(1))
+            mkey = mm if mm else "STATIC"
+        m_sv = SUBVAR.search(desc)
+        if m_sv:
+            subvar = m_sv.group(0).upper()
+    if subvar is None:
+        subvar = major_var
+    return f"{major_var}.{subvar}", mkey
+
+def get_band_descs(ds):
+    descs = list(ds.descriptions) if ds.descriptions and any(ds.descriptions) else [None] * ds.count
+    if len(descs) != ds.count:
+        descs = (descs + [None] * ds.count)[:ds.count]
+    return descs
+
+def out_hw(h, w, s):
+    return math.ceil(h / s), math.ceil(w / s)
+
+def is_categorical_channel(chname: str) -> bool:
+    up = chname.upper()
+    return up.startswith("LC") or ".LC" in up
+
+def read_downsample(ds, b, oh, ow, resampling):
+    arr = ds.read(b, masked=True, out_shape=(oh, ow), resampling=resampling).astype(np.float32)
+    if np.ma.isMaskedArray(arr):
+        arr = arr.filled(np.nan)
+    return arr
+
+def choose_target_channel(channels):
+    for pref in TARGET_PREFS:
+        for ch in channels:
+            if ch.upper().endswith(pref.upper()):
+                return ch
+    for ch in channels:
+        if "LST" in ch.upper() and "LSTN" not in ch.upper():
+            return ch
+    for ch in channels:
+        if "LST" in ch.upper():
+            return ch
+    return None
+
+def find_ntl_channel(channels):
+    for ch in channels:
+        if any(k in ch.upper() for k in NTL_KEYS):
+            return ch
+    return None
+
+def build_ntl_core_mask(ntl_img_2d: np.ndarray, pct_brightest: float, ntl_min_abs: float = 0.0):
+    m = np.isfinite(ntl_img_2d)
+    if not m.any():
+        return np.ones_like(ntl_img_2d, dtype=bool)
+    vals = ntl_img_2d[m]
+    q = np.nanpercentile(vals, 100 - pct_brightest)
+    return m & (ntl_img_2d >= max(q, ntl_min_abs))
+
+def era5_block_size(fine_deg, era_deg, spatial_subsample):
+    eff_deg = fine_deg * spatial_subsample
+    blk = int(round(era_deg / eff_deg))
+    return max(1, blk)
+
+def find_required_feature_indices(channels):
+    req = []
+    upchs = [c.upper() for c in channels]
+    for s in REQ_SUBSTRINGS:
+        su = s.upper()
+        hit = None
+        for i, uc in enumerate(upchs):
+            if su in uc:
+                hit = i
+                break
+        if hit is not None:
+            req.append(hit)
+    return sorted(set(req))
+
+def infer_water_mask_from_lc(channels, ch2i, THWC):
+    lc_candidates = [c for c in channels if c.upper().startswith("LC")]
+    if not lc_candidates:
+        return None
+    lc_idx = ch2i[lc_candidates[0]]
+    lc_img = THWC[0, :, :, lc_idx]
+    lc_round = np.rint(lc_img).astype(np.float32)
+    return np.isfinite(lc_round) & (lc_round == float(WATER_CODE))
+
+def should_keep_channel(chname: str) -> bool:
+    up = chname.upper()
+    if any(h in up for h in ALWAYS_KEEP_TARGET_HINTS):
+        return True
+    if not USE_CHANNEL_PREFILTER:
+        return True
+    return any(k.upper() in up for k in KEEP_CHANNEL_SUBSTRINGS)
+
+# ============================================================
+# 3) Sampling
+# ============================================================
+def era5_guided_one_pixel_per_block_waterdrop(valid_mask_2d, block, rng,
+                                              water_mask_2d=None,
+                                              water_frac_thr=0.7,
+                                              require_land_pixel=True,
+                                              k_per_cell=1):
+    H, W = valid_mask_2d.shape
+    Hb = H // block
+    Wb = W // block
+    if Hb == 0 or Wb == 0:
+        return np.array([], dtype=np.int64), {"blocks_total": 0, "blocks_used": 0, "blocks_drop_water": 0}
+
+    Ht, Wt = Hb * block, Wb * block
+    valid_trim = valid_mask_2d[:Ht, :Wt]
+    valid_blk = valid_trim.reshape(Hb, block, Wb, block).transpose(0, 2, 1, 3)
+    valid_count = valid_blk.sum(axis=(2, 3)).astype(np.int32)
+
+    blocks_total = Hb * Wb
+    usable = valid_count > 0
+
+    blocks_drop_water = 0
+    if water_mask_2d is not None:
+        water_trim = water_mask_2d[:Ht, :Wt]
+        water_blk = water_trim.reshape(Hb, block, Wb, block).transpose(0, 2, 1, 3)
+        water_in_valid = (water_blk & valid_blk).sum(axis=(2, 3)).astype(np.int32)
+        water_frac = water_in_valid / np.maximum(valid_count, 1)
+        drop_water = (water_frac > water_frac_thr) & usable
+        blocks_drop_water = int(drop_water.sum())
+        usable = usable & (~drop_water)
+        land_blk = valid_blk & (~water_blk)
+    else:
+        land_blk = valid_blk
+
+    block_indices = np.argwhere(usable)
+    chosen_list = []
+    blocks_used = 0
+
+    for bi, bj in block_indices:
+        if water_mask_2d is not None and require_land_pixel:
+            sub = land_blk[bi, bj]
+            rr, cc = np.where(sub)
+            if rr.size == 0:
+                rr, cc = np.where(valid_blk[bi, bj])
+        else:
+            rr, cc = np.where(valid_blk[bi, bj])
+
+        n = rr.size
+        if n == 0:
+            continue
+
+        pick = rng.integers(0, n)  # K=1 fastest
+        r = bi * block + rr[pick]
+        c = bj * block + cc[pick]
+        chosen_list.append(r * W + c)
+        blocks_used += 1
+
+    stats = {
+        "blocks_total": int(blocks_total),
+        "blocks_used": int(blocks_used),
+        "blocks_drop_water": int(blocks_drop_water),
+        "k_per_cell": 1
+    }
+    return np.array(chosen_list, dtype=np.int64), stats
+
+# ============================================================
+# 4) Process one city (latest year only)
+# ============================================================
+def process_one_city(root, city, spatial_subsample=1, sample_frac=1.0, rng=None):
+    cdir, files = city_files(root, city)
+    if not files:
+        if VERBOSE: print(f"[{city}] ⚠️ No tif; skip.")
+        return None
+
+    if VERBOSE: print(f"\n[{city}] Detected {len(files)} files.")
+
+    example_shape = None
+    all_months, all_channels = set(), set()
+    index_per_file = []
+
+    for fn in tqdm(files, desc=f"[{city}] Scan", unit="file", disable=not VERBOSE):
+        path = os.path.join(cdir, fn)
+        major = infer_var_from_filename(fn, city)
+        try:
+            with rasterio.open(path) as ds:
+                if example_shape is None:
+                    example_shape = (ds.height, ds.width)
+                elif (ds.height, ds.width) != example_shape:
+                    if VERBOSE: print(f"[{city}] Inconsistent dims: {fn}, skip.")
+                    continue
+                descs = get_band_descs(ds)
+                triples = []
+                for b in range(1, ds.count + 1):
+                    ch, mk = parse_band_desc(descs[b - 1], major)
+                    all_channels.add(ch)
+                    if mk != "STATIC":
+                        all_months.add(mk)
+                    triples.append((b, mk, ch))
+                index_per_file.append((path, triples))
+        except Exception as e:
+            if VERBOSE: print(f"[{city}] [Index skip] {fn}: {repr(e)}")
+
+    if not index_per_file:
+        return None
+
+    months_all = sorted(all_months)
+    channels_all = sorted(all_channels)
+    if len(months_all) == 0:
+        if VERBOSE: print(f"[{city}] ⚠️ No dynamic months; skip.")
+        return None
+
+    rng = np.random.default_rng(RANDOM_SEED) if rng is None else rng
+
+    # ---- keep ONLY latest year
+    months = months_all
+    if USE_LATEST_YEAR_ONLY:
+        years = [int(m[:4]) for m in months_all if m and len(m) >= 6 and m[:4].isdigit()]
+        if not years:
+            if VERBOSE: print(f"[{city}] ⚠️ Cannot parse years from months; skip.")
+            return None
+        y_latest = max(years)
+        months = [m for m in months_all if m.startswith(str(y_latest))]
+        if VERBOSE:
+            print(f"[{city}] Latest year = {y_latest}; months kept: {len(months_all)} -> {len(months)}")
+
+    # ---- channel prefilter
+    channels = channels_all
+    if USE_CHANNEL_PREFILTER:
+        channels = [c for c in channels_all if should_keep_channel(c)]
+        if VERBOSE:
+            print(f"[{city}] Channels kept: {len(channels_all)} -> {len(channels)}")
+
+    ch2i = {c: i for i, c in enumerate(channels)}
+    m2i  = {m: i for i, m in enumerate(months)}
+
+    # ---- prune triples early
+    if PRUNE_TRIPLES_EARLY:
+        pruned = []
+        for path, triples in index_per_file:
+            tt = [(b, mk, ch) for (b, mk, ch) in triples if (ch in ch2i) and (mk == "STATIC" or mk in m2i)]
+            if tt:
+                pruned.append((path, tt))
+        index_per_file = pruned
+
+    H, W = example_shape
+    H2, W2 = out_hw(H, W, spatial_subsample)
+    T, C = len(months), len(channels)
+    if T == 0 or C == 0:
+        return None
+
+    if VERBOSE:
+        print(f"[{city}] T={T} C={C} H2xW2={H2}x{W2} (S={spatial_subsample})")
+
+    # ---- static cache
+    static_cache = {}
+    for ch in channels:
+        acc, cnt = None, 0
+        for path, triples in index_per_file:
+            for b, mk, c in triples:
+                if c != ch or mk != "STATIC":
+                    continue
+                try:
+                    with rasterio.open(path) as ds:
+                        oh, ow = out_hw(ds.height, ds.width, spatial_subsample)
+                        resamp = Resampling.nearest if is_categorical_channel(ch) else Resampling.average
+                        x = read_downsample(ds, b, oh, ow, resamp)
+                except Exception:
+                    continue
+
+                if acc is None:
+                    acc, cnt = x, 1
+                else:
+                    if is_categorical_channel(ch):
+                        m1 = np.isfinite(acc); m2 = np.isfinite(x)
+                        acc[~m1 & m2] = x[~m1 & m2]
+                    else:
+                        m1 = np.isfinite(acc); m2 = np.isfinite(x); both = m1 & m2
+                        acc[~m1 & m2] = x[~m1 & m2]
+                        acc[both] = (acc[both] * cnt + x[both]) / (cnt + 1)
+                        cnt += 1
+        if acc is not None:
+            static_cache[ch2i[ch]] = acc
+
+    # ---- SUM/CNT
+    SUM = np.zeros((T, H2, W2, C), np.float32)
+    CNT = np.zeros((T, H2, W2, C), np.uint16)
+
+    def add_sumcnt(t_idx, c_idx, arr2d):
+        m = np.isfinite(arr2d)
+        if m.any():
+            SUM[t_idx, :arr2d.shape[0], :arr2d.shape[1], c_idx][m] += arr2d[m]
+            CNT[t_idx, :arr2d.shape[0], :arr2d.shape[1], c_idx][m] += 1
+
+    for path, triples in tqdm(index_per_file, desc=f"[{city}] SUM/CNT", unit="file", disable=not VERBOSE):
+        with rasterio.open(path) as ds:
+            oh, ow = out_hw(ds.height, ds.width, spatial_subsample)
+
+            per_bucket = defaultdict(list)
+            for b, mk, ch in triples:
+                if mk == "STATIC":
+                    continue
+                if mk not in m2i or ch not in ch2i:
+                    continue
+                per_bucket[(m2i[mk], ch2i[ch])].append(b)
+
+            if not per_bucket:
+                continue
+
+            for (t_idx, c_idx), band_list in per_bucket.items():
+                chname = channels[c_idx]
+                resamp = Resampling.nearest if is_categorical_channel(chname) else Resampling.average
+                try:
+                    data = ds.read(
+                        indexes=sorted(band_list), masked=True,
+                        out_shape=(len(band_list), oh, ow),
+                        resampling=resamp
+                    ).astype(np.float32)
+                    if np.ma.isMaskedArray(data):
+                        data = data.filled(np.nan)
+
+                    if is_categorical_channel(chname):
+                        arr = np.rint(data[0]).astype(np.float32)
+                    else:
+                        arr = np.nanmean(data, axis=0).astype(np.float32)
+
+                    add_sumcnt(t_idx, c_idx, arr)
+                except Exception:
+                    continue
+        gc.collect()
+
+    # ---- THWC
+    THWC = np.full((T, H2, W2, C), np.nan, np.float32)
+    valid = CNT > 0
+    THWC[valid] = (SUM[valid] / CNT[valid]).astype(np.float32)
+    for c_idx, arr in static_cache.items():
+        THWC[:, :arr.shape[0], :arr.shape[1], c_idx] = arr
+
+    # ---- core mask
+    if USE_NTL_CORE:
+        ntl_ch = find_ntl_channel(channels)
+        if ntl_ch is not None:
+            ntl_img = THWC[0, :, :, ch2i[ntl_ch]]
+            core_mask = build_ntl_core_mask(ntl_img, NTL_PCT_BRIGHTEST, NTL_MIN_ABS)
+        else:
+            core_mask = np.ones((H2, W2), dtype=bool)
+    else:
+        core_mask = np.ones((H2, W2), dtype=bool)
+
+    # ---- water mask
+    water_mask = infer_water_mask_from_lc(channels, ch2i, THWC)
+
+    # ---- sample
+    block = era5_block_size(FINE_DEG, ERA_DEG, spatial_subsample)
+    pix_idx, blk_stats = era5_guided_one_pixel_per_block_waterdrop(
+        valid_mask_2d=core_mask,
+        block=block,
+        rng=rng,
+        water_mask_2d=water_mask,
+        water_frac_thr=WATER_FRAC_THR,
+        require_land_pixel=REQUIRE_LAND_PIXEL
+    )
+
+    if pix_idx.size < MIN_CITY_PIXELS:
+        if VERBOSE: print(f"[{city}] ⚠️ too few pix {pix_idx.size}; skip.")
+        return None
+
+    target_ch = choose_target_channel(channels)
+    if not target_ch:
+        if VERBOSE: print(f"[{city}] ⚠️ target LST not found; skip.")
+        return None
+    y_cidx = ch2i[target_ch]
+    req_idx_city = find_required_feature_indices(channels)
+
+    X_list, y_list = [], []
+    kept = []
+    for t in range(T):
+        slab = THWC[t]
+        feat = slab.reshape(-1, C)[pix_idx]
+        yy   = slab[..., y_cidx].reshape(-1)[pix_idx]
+
+        m = np.isfinite(yy)
+        if req_idx_city:
+            m = m & np.all(np.isfinite(feat[:, req_idx_city]), axis=1)
+
+        if not m.any():
+            kept.append(0)
+            continue
+        X_list.append(feat[m])
+        y_list.append(yy[m])
+        kept.append(int(m.sum()))
+
+    if not X_list:
+        return None
+
+    X_city = np.concatenate(X_list, axis=0).astype(np.float32)
+    y_city = np.concatenate(y_list, axis=0).astype(np.float32)
+
+    if 0 < sample_frac < 1.0 and X_city.shape[0] > 0:
+        keep = rng.choice(X_city.shape[0], size=int(round(sample_frac * X_city.shape[0])), replace=False)
+        X_city, y_city = X_city[keep], y_city[keep]
+
+    if VERBOSE:
+        print(f"[{city}] latest-year samples: X={X_city.shape}, y={y_city.shape} | kept/month min/med/max={np.min(kept)}/{np.median(kept)}/{np.max(kept)}")
+
+    return {
+        "city": city,
+        "X": X_city,
+        "y": y_city,
+        "channels": channels,
+        "target_ch": target_ch,
+        "n_pix_blocks": int(pix_idx.size),
+        "n_samples": int(X_city.shape[0]),
+        "block": int(block),
+        "blocks_total": blk_stats["blocks_total"],
+        "blocks_used": blk_stats["blocks_used"],
+        "blocks_drop_water": blk_stats["blocks_drop_water"],
+        "req_found": int(len(req_idx_city)),
+        "months_latest_year": int(T),
+    }
+
+# ============================================================
+# 5) Main merge
+# ============================================================
+all_cities = list_cities(ROOT)
+assert all_cities, f"No city subdirectories found under {ROOT}"
+cities_ordered = apply_city_whitelist(all_cities, CITY_WHITELIST)
+
+print(f"Number of cities discovered: {len(all_cities)}")
+print(f"Processing first {CITY_LIMIT} cities: {cities_ordered[:CITY_LIMIT]}")
+
+per_city = []
+city_stats = []
+
+for city in cities_ordered:
+    if len(per_city) >= CITY_LIMIT:
+        break
+    res = process_one_city(ROOT, city, SPATIAL_SUBSAMPLE, SAMPLE_FRAC)
+    if res is not None:
+        per_city.append(res)
+        city_stats.append({
+            "city": res["city"],
+            "n_pix_blocks": res["n_pix_blocks"],
+            "n_samples": res["n_samples"],
+            "block": res["block"],
+            "target_ch": res["target_ch"],
+            "blocks_total": res["blocks_total"],
+            "blocks_used": res["blocks_used"],
+            "blocks_drop_water": res["blocks_drop_water"],
+            "req_found": res["req_found"],
+            "months_latest_year": res["months_latest_year"],
+        })
+
+assert per_city, "No city reached the threshold or generated valid samples."
+
+# ---- Intersection channels
+channel_sets = [set(x["channels"]) for x in per_city]
+common_channels = sorted(set.intersection(*channel_sets))
+
+# ---- Exclude LST* from features
+if EXCLUDE_LST_FEATURES:
+    common_channels = [c for c in common_channels if "LST" not in c.upper()]
+
+print(f"Number of feature channels (intersection, excl. LST*): {len(common_channels)}")
+
+# ---- Merge + META.CITY_ID
+city2id = {c["city"]: i for i, c in enumerate(per_city)}
+allX, ally, used_city_names = [], [], []
+
+for item in per_city:
+    chs = item["channels"]
+    col_idx = [chs.index(c) for c in common_channels] if common_channels else []
+    Xc = item["X"][:, col_idx] if col_idx else item["X"][:, []]
+
+    cid_col = np.full((Xc.shape[0], 1), city2id[item["city"]], dtype=np.float32)
+    Xc = np.hstack([Xc, cid_col])
+
+    allX.append(Xc)
+    ally.append(item["y"])
+    used_city_names.extend([item["city"]] * Xc.shape[0])
+
+X = np.vstack(allX).astype(np.float32)
+y = np.concatenate(ally).astype(np.float32)
+channels_final = common_channels + ["META.CITY_ID"]
+
+print(f"\n✅ Merge complete: X={X.shape}, y={y.shape}")
+print(f"Used cities (n={len(sorted(set(used_city_names)))}): {sorted(set(used_city_names))[:10]} ...")
+print(f"Feature channels ({len(channels_final)}): first 10 -> {channels_final[:10]}")
+
+np.savez_compressed(
+    OUT_NPZ,
+    X=X, y=y,
+    channels=np.array(channels_final, dtype=object),
+    used_cities=np.array(sorted(set(used_city_names)), dtype=object),
+    note=(
+        f"LATEST-1Y dataset: keep only latest year months per city; "
+        f"FINE_DEG={FINE_DEG}, ERA_DEG={ERA_DEG}, SPATIAL_SUBSAMPLE={SPATIAL_SUBSAMPLE} -> block={era5_block_size(FINE_DEG, ERA_DEG, SPATIAL_SUBSAMPLE)}; "
+        f"channel_prefilter={USE_CHANNEL_PREFILTER}, keys={KEEP_CHANNEL_SUBSTRINGS}; "
+        f"NTL core={USE_NTL_CORE}; water_frac_thr={WATER_FRAC_THR}, require_land_pixel={REQUIRE_LAND_PIXEL}; "
+        f"require target + core predictors finite; LST* excluded; META.CITY_ID appended"
+    )
+)
+
+df_stats = pd.DataFrame(city_stats).sort_values("city")
+df_stats.to_csv(OUT_CITY_STATS, index=False, encoding="utf-8")
+
+print(f"📦 Saved NPZ: {OUT_NPZ}")
+print(f"📄 Saved city sampling stats: {OUT_CITY_STATS}")
